@@ -1,4 +1,13 @@
 import argparse
+import os
+import sys
+from pathlib import Path
+
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.append(str(PROJECT_ROOT))
 
 import numpy as np
 import torch
@@ -8,8 +17,8 @@ from rl4co.envs.pc.generator import FPIGenerator
 
 
 DEFAULT_GENERATOR_PARAMS = dict(
-    num_parts=10,
-    max_num_parts=10,
+    num_parts=4,
+    max_num_parts=4,
     topology_mode="dense_clustered",
     material_types=2,
     p_relative_motion=0.03,
@@ -20,9 +29,9 @@ DEFAULT_GENERATOR_PARAMS = dict(
     W_high=55.0,
     H_low=2.0,
     H_high=24.0,
-    build_limit_L=450.0,
-    build_limit_W=220.0,
-    build_limit_H=120.0,
+    build_limit_L=1000.0,
+    build_limit_W=1000.0,
+    build_limit_H=500.0,
     p_maint_H=0.02,
     p_standard=0.01,
 )

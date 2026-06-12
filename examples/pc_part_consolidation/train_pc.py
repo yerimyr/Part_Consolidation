@@ -143,7 +143,7 @@ def main():
     # =========================
     generator_params = dict(
         num_parts=4,
-        max_num_parts=10,
+        max_num_parts=20,
         material_types=2,
         p_relative_motion=0.03,
         p_extra_edge=0.80,
