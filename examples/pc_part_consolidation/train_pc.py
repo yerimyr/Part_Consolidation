@@ -89,10 +89,10 @@ def main():
     # =========================
     # Hyperparameters
     # =========================
-    batch_size = 64
-    eval_batch_size = 64
+    batch_size = 128
+    eval_batch_size = 128
     eval_seed = 4321
-    epochs = 500
+    epochs = 10000
     lr = 1e-4
     grad_clip = 1.0
     entropy_start = 0.05

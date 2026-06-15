@@ -422,7 +422,7 @@ class GASolver:
             best_similarities.append(max(sim_p1, sim_p2))
             mean_similarities.append((sim_p1 + sim_p2) / 2.0)
 
-            if len(examples) < 5:
+            if len(examples) < 4:
                 examples.append(
                     {
                         "generation": generation,
