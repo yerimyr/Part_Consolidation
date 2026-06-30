@@ -80,48 +80,6 @@ def make_fixed_eval_td(
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
-def canonical_grouping_key(groups):
-    return tuple(sorted(tuple(sorted(group)) for group in groups))
-
-
-def evaluate_sampling_best(
-    env: PartConsolidationEnv,
-    policy: PCPolicy,
-    td_eval,
-    max_steps: int,
-    sample_count: int,
-    num_nodes: int,
-):
-    rewards = []
-    unique_keys_by_instance = [set() for _ in range(td_eval.batch_size[0])]
-
-    for _ in range(sample_count):
-        actions, _, _, reward, _, _ = rollout_episode_from_td(
-            env=env,
-            policy=policy,
-            td_init=td_eval,
-            max_steps=max_steps,
-            sample=True,
-            epsilon=0.0,
-        )
-        rewards.append(reward)
-
-        groups_batch = env.actions_to_groups(actions, N=num_nodes)
-        for idx, groups in enumerate(groups_batch):
-            unique_keys_by_instance[idx].add(canonical_grouping_key(groups))
-
-    reward_samples = torch.stack(rewards, dim=0)
-    unique_ratio = float(
-        np.mean([len(keys) / float(sample_count) for keys in unique_keys_by_instance])
-    )
-
-    return {
-        "reward_sample_mean": reward_samples.mean(),
-        "reward_sample_best": reward_samples.max(dim=0).values.mean(),
-        "unique_grouping_ratio": unique_ratio,
-    }
-
-
 def main():
     train_start_time = time.time()
 
@@ -133,7 +91,6 @@ def main():
     # =========================
     batch_size = 256
     eval_batch_size = 128
-    eval_sample_count = 64
     eval_seed = 4321
     epochs = 1000
     lr = 1e-4
@@ -150,14 +107,6 @@ def main():
     writer.add_custom_scalars(
         {
             "Reward Components": {
-                "Eval reward comparison": [
-                    "Multiline",
-                    [
-                        "eval/reward_greedy",
-                        "eval/reward_sample_mean",
-                        "eval/reward_sample_best",
-                    ],
-                ],
                 "Train weighted objective terms": [
                     "Multiline",
                     ["train/Q_observed", "train/Q_expected_penalty", "train/Q_gamma"],
@@ -320,24 +269,11 @@ def main():
                 )
                 eval_metrics = env.reward_metrics_from_actions(actions_eval)
                 eval_q_observed, eval_q_expected_penalty, eval_q_gamma = env._terminal_reward_terms(eval_metrics)
-                sample_eval = evaluate_sampling_best(
-                    env=env,
-                    policy=policy,
-                    td_eval=td_eval_fixed,
-                    max_steps=max_steps,
-                    sample_count=eval_sample_count,
-                    num_nodes=gen.num_nodes,
-                )
 
             avg_eval = reward_eval.mean().item()
-            avg_sample_mean = sample_eval["reward_sample_mean"].item()
-            avg_sample_best = sample_eval["reward_sample_best"].item()
 
             writer.add_scalar("eval/reward_total", avg_eval, ep)
             writer.add_scalar("eval/reward_greedy", avg_eval, ep)
-            writer.add_scalar("eval/reward_sample_mean", avg_sample_mean, ep)
-            writer.add_scalar("eval/reward_sample_best", avg_sample_best, ep)
-            writer.add_scalar("eval/unique_grouping_ratio", sample_eval["unique_grouping_ratio"], ep)
             writer.add_scalar("eval/feasible_ratio", eval_metrics["feasible"].mean().item(), ep)
             writer.add_scalar("eval/infeasible_solution", eval_metrics["infeasible_solution"].mean().item(), ep)
             writer.add_scalar("eval/infeasible_groups", eval_metrics["infeasible_groups"].mean().item(), ep)
@@ -368,8 +304,6 @@ def main():
                 f"[{ep:5d}] "
                 f"train_total={total_reward.mean().item():.4f} "
                 f"eval_greedy={avg_eval:.4f} "
-                f"eval_sample_mean={avg_sample_mean:.4f} "
-                f"eval_sample_best={avg_sample_best:.4f} "
                 f"train_feasible={reward_metrics['feasible'].mean().item():.3f} "
                 f"eval_feasible={eval_metrics['feasible'].mean().item():.3f} "
                 f"loss={loss.item():.4f} "
