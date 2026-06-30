@@ -26,18 +26,11 @@ class EdgeAwareMessagePassing(nn.Module):
 
 class PCPolicy(nn.Module):
     """
-    Policy for sequential part consolidation.
-
-    Inputs:
-    - static node features from generator
-    - dynamic state features from env
-    - pairwise edge features
-    - positional adjacency matrix W
+    Policy for merge-based part consolidation.
 
     Output:
-    - action index
-      0   : SEP
-      1..N: choose next part
+    - action 0: STOP
+    - action 1..K: merge one fixed group-slot pair
     """
 
     def __init__(
@@ -53,8 +46,8 @@ class PCPolicy(nn.Module):
         super().__init__()
 
         self.base_node_feat_dim = node_feat_dim
-        # assigned, open_group, action_mask, fallback_mask, open_group_size_ratio(3)
-        self.dynamic_node_feat_dim = 1 + 1 + 1 + 1 + 3
+        # valid_part, normalized current group cardinality
+        self.dynamic_node_feat_dim = 2
         self.total_node_feat_dim = self.base_node_feat_dim + self.dynamic_node_feat_dim
         self.temperature = float(temperature)
 
@@ -63,38 +56,32 @@ class PCPolicy(nn.Module):
             [EdgeAwareMessagePassing(emb_dim, edge_feat_dim) for _ in range(num_message_passing)]
         )
 
-        self.context_proj = nn.Linear(emb_dim, emb_dim, bias=False)
-        self.key_proj = nn.Linear(emb_dim, emb_dim, bias=False)
-        self.value_proj = nn.Linear(emb_dim, emb_dim, bias=False)
-        self.sep_gate = nn.Linear(emb_dim, 1)
-        self.decoder_token_proj = nn.Linear(emb_dim * 3, emb_dim)
-        decoder_layer = nn.TransformerDecoderLayer(
-            d_model=emb_dim,
-            nhead=num_decoder_heads,
-            dim_feedforward=emb_dim * 4,
-            dropout=0.0,
-            batch_first=True,
-            activation="gelu",
+        self.pair_scorer = nn.Sequential(
+            nn.Linear(emb_dim * 4, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, 1),
         )
-        self.decoder = nn.TransformerDecoder(decoder_layer, num_layers=num_decoder_layers)
+        self.stop_scorer = nn.Sequential(
+            nn.Linear(emb_dim, emb_dim),
+            nn.GELU(),
+            nn.Linear(emb_dim, 1),
+        )
         self.logit_bias = nn.Parameter(torch.zeros(1))
 
     def build_dynamic_node_features(self, td: TensorDict) -> torch.Tensor:
         B, N, _ = td["node_features"].shape
 
-        assigned = td["assigned"].float().unsqueeze(-1)
-        open_group = td["open_group"].float().unsqueeze(-1)
-        action_mask = td["action_mask"].float().unsqueeze(-1)
-        fallback_mask = td.get("fallback_part_mask", torch.zeros_like(td["assigned"])).float().unsqueeze(-1)
+        group_id = td["group_id"]
+        valid_part = td.get("valid_part_mask", group_id.ge(0)).float().unsqueeze(-1)
+        group_card = torch.zeros((B, N), dtype=torch.float32, device=group_id.device)
+        for b in range(B):
+            ids = torch.unique(group_id[b][group_id[b] >= 0])
+            for gid in ids.tolist():
+                members = group_id[b].eq(int(gid))
+                group_card[b, members] = members.float().sum()
+        group_card_ratio = (group_card / max(float(N - 1), 1.0)).unsqueeze(-1)
 
-        build_limit = td["build_limit"].float().clamp_min(1e-6)
-        open_group_size = td["open_group_size"].float()
-        open_group_size_ratio = (open_group_size / build_limit).unsqueeze(1).expand(B, N, 3)
-
-        dyn = torch.cat(
-            [assigned, open_group, action_mask, fallback_mask, open_group_size_ratio],
-            dim=-1,
-        )
+        dyn = torch.cat([valid_part, group_card_ratio], dim=-1)
         return dyn
 
     def encode(self, td: TensorDict) -> torch.Tensor:
@@ -111,33 +98,39 @@ class PCPolicy(nn.Module):
         return h
 
     def compute_logits(self, node_emb: torch.Tensor, td: TensorDict) -> torch.Tensor:
-        open_group = td["open_group"]
         B, N, E = node_emb.shape
+        group_id = td["group_id"]
+        action_mask = td["action_mask"]
+        num_actions = action_mask.size(-1)
+        max_parts = N - 1
+        pair_list = [(i, j) for i in range(max_parts) for j in range(i + 1, max_parts)]
 
-        has_open = open_group.any(dim=-1, keepdim=True)
-        denom = open_group.float().sum(dim=-1, keepdim=True).clamp_min(1.0)
-        group_mean = (node_emb * open_group.float().unsqueeze(-1)).sum(dim=1) / denom
+        valid = td.get("valid_part_mask", group_id.ge(0))
+        part_mask = valid[:, 1:].float()
+        global_denom = part_mask.sum(dim=-1, keepdim=True).clamp_min(1.0)
+        global_context = (node_emb[:, 1:, :] * part_mask.unsqueeze(-1)).sum(dim=1) / global_denom
 
-        sep_emb = node_emb[:, 0, :]
-        assigned = td["assigned"].float()
-        assigned_denom = assigned.sum(dim=-1, keepdim=True).clamp_min(1.0)
-        assigned_mean = (node_emb * assigned.unsqueeze(-1)).sum(dim=1) / assigned_denom
+        logits = torch.full((B, num_actions), -1e9, dtype=node_emb.dtype, device=node_emb.device)
+        logits[:, 0] = self.stop_scorer(global_context).squeeze(-1)
 
-        context = torch.where(has_open, group_mean, sep_emb)
-        decoder_state = torch.cat([sep_emb, context, assigned_mean], dim=-1)
-        tgt = self.decoder_token_proj(decoder_state).unsqueeze(1)
+        for b in range(B):
+            group_emb: dict[int, torch.Tensor] = {}
+            ids = sorted({int(g) for g in group_id[b, 1:][valid[b, 1:]].tolist() if int(g) >= 0})
+            for gid in ids:
+                members = (group_id[b] == gid) & valid[b]
+                denom = members.float().sum().clamp_min(1.0)
+                group_emb[gid] = (node_emb[b] * members.float().unsqueeze(-1)).sum(dim=0) / denom
 
-        memory = node_emb
-        decoded = self.decoder(tgt=tgt, memory=memory).squeeze(1)
+            for action_idx, (ga, gb) in enumerate(pair_list, start=1):
+                if action_idx >= num_actions:
+                    break
+                if ga not in group_emb or gb not in group_emb:
+                    continue
+                ha = group_emb[ga]
+                hb = group_emb[gb]
+                feat = torch.cat([ha, hb, torch.abs(ha - hb), ha * hb], dim=-1)
+                logits[b, action_idx] = self.pair_scorer(feat).squeeze(-1)
 
-        query = self.context_proj(decoded).unsqueeze(1)
-        keys = self.key_proj(node_emb)
-        values = self.value_proj(node_emb)
-        logits = torch.matmul(query, keys.transpose(-1, -2)).squeeze(1)
-        logits = logits / (E ** 0.5)
-
-        logits[:, 0] = logits[:, 0] + self.sep_gate(decoded).squeeze(-1)
-        logits = logits + (query * values).sum(dim=-1) * 0.0
         logits = logits + self.logit_bias
         return logits
 

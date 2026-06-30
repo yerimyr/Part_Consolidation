@@ -12,8 +12,8 @@ class PartConsolidationEnv:
     General-graph Part Consolidation environment.
 
     Action space:
-        0     : SEP (close current open group)
-        1..N  : choose one real part and add it to the current group
+        0       : STOP (terminate with current grouping)
+        1..K    : merge one pair of currently active groups
 
     Reward:
         terminal reward only
@@ -33,6 +33,11 @@ class PartConsolidationEnv:
         self.allow_fallback = bool(allow_fallback)
 
         self.N = self.generator.num_nodes
+        self.max_parts = self.N - 1
+        self.group_pair_list = [
+            (i, j) for i in range(self.max_parts) for j in range(i + 1, self.max_parts)
+        ]
+        self.num_actions = 1 + len(self.group_pair_list)
         self.F = self.generator.node_feat_dim
         self._reward_static_td: TensorDict | None = None
         self._reward_eps = 1e-8
@@ -43,38 +48,30 @@ class PartConsolidationEnv:
         B = batch_size
         valid_part_mask = td.get("valid_part_mask", torch.ones((B, self.N), dtype=torch.bool, device=self.device))
 
-        assigned = torch.zeros((B, self.N), dtype=torch.bool, device=self.device)
-        assigned[:, 0] = True
-        assigned = assigned | (~valid_part_mask)
-
-        open_group = torch.zeros((B, self.N), dtype=torch.bool, device=self.device)
-        open_group_size = torch.zeros((B, 3), dtype=torch.float32, device=self.device)
-        closed_group_count = torch.zeros((B,), dtype=torch.long, device=self.device)
+        group_id = torch.full((B, self.N), -1, dtype=torch.long, device=self.device)
+        for node in range(1, self.N):
+            group_id[:, node] = node - 1
+        group_id = torch.where(valid_part_mask, group_id, torch.full_like(group_id, -1))
 
         td_out = TensorDict(
             {
                 **td,
-                "assigned": assigned,
-                "open_group": open_group,
-                "open_group_size": open_group_size,
-                "closed_group_count": closed_group_count,
+                "group_id": group_id,
                 "fallback_part_mask": torch.zeros((B, self.N), dtype=torch.bool, device=self.device),
                 "dead_end": torch.zeros((B, 1), dtype=torch.bool, device=self.device),
                 "done": torch.zeros((B, 1), dtype=torch.bool, device=self.device),
-                "action_mask": torch.ones((B, self.N), dtype=torch.bool, device=self.device),
+                "action_mask": torch.ones((B, self.num_actions), dtype=torch.bool, device=self.device),
             },
             batch_size=[B],
         )
 
         td_out["action_mask"] = self.get_action_mask(td_out)
-        td_out["dead_end"] = self._compute_dead_end(td_out["assigned"], td_out["open_group"], td_out["action_mask"])
-        td_out["done"] = (td_out["done"] | td_out["dead_end"]).clone()
+        td_out["dead_end"] = torch.zeros((B, 1), dtype=torch.bool, device=self.device)
         self._reward_static_td = td_out.clone()
         return td_out
 
     def get_action_mask(self, td: TensorDict) -> torch.Tensor:
-        assigned = td["assigned"]
-        open_group = td["open_group"]
+        group_id = td["group_id"]
         size = td["size"]
         build_limit = td["build_limit"]
         assembly_adj = td["assembly_adj"]
@@ -82,153 +79,74 @@ class PartConsolidationEnv:
         mat_var = td["mat_var"]
         maint_diff = td["maint_diff"]
         rel_motion = td["rel_motion"]
-        valid_part_mask = td.get("valid_part_mask", torch.ones_like(assigned))
+        valid_part_mask = td.get("valid_part_mask", group_id.ge(0))
 
-        B, N = assigned.shape
-        mask = torch.zeros((B, N), dtype=torch.bool, device=assigned.device)
-        fallback_part_mask = torch.zeros((B, N), dtype=torch.bool, device=assigned.device)
+        B, _ = group_id.shape
+        mask = torch.zeros((B, self.num_actions), dtype=torch.bool, device=group_id.device)
+        mask[:, 0] = True
 
-        open_any = open_group.any(dim=-1)
-        real_valid = valid_part_mask[:, 1:]
-        all_assigned = (assigned[:, 1:] | (~real_valid)).all(dim=-1)
+        for b in range(B):
+            if bool(td["done"][b].item()):
+                mask[b] = False
+                mask[b, 0] = True
+                continue
 
-        # --------------------------
-        # Case 1: open group exists
-        # --------------------------
-        if open_any.any():
-            feasible_part = torch.zeros((B, N), dtype=torch.bool, device=assigned.device)
-            feasible_part[:, 0] = False
+            active_groups = sorted(
+                {
+                    int(g)
+                    for g in group_id[b, 1:][valid_part_mask[b, 1:]].tolist()
+                    if int(g) >= 0
+                }
+            )
+            group_nodes = {
+                gid: torch.where((group_id[b] == gid) & valid_part_mask[b])[0].tolist()
+                for gid in active_groups
+            }
+            group_nodes = {gid: [node for node in nodes if node > 0] for gid, nodes in group_nodes.items()}
 
-            for b in range(B):
-                if not bool(open_any[b].item()):
+            for action_idx, (ga, gb) in enumerate(self.group_pair_list, start=1):
+                if ga not in group_nodes or gb not in group_nodes:
                     continue
+                candidate = sorted(group_nodes[ga] + group_nodes[gb])
+                if self._group_feasible(
+                    candidate,
+                    size[b],
+                    build_limit[b],
+                    isstandard[b],
+                    mat_var[b],
+                    maint_diff[b],
+                    rel_motion[b],
+                    assembly_adj[b],
+                ):
+                    mask[b, action_idx] = True
 
-                current_group = torch.where(open_group[b])[0].tolist()
-                for node in range(1, N):
-                    if not bool(valid_part_mask[b, node].item()):
-                        continue
-                    if bool(assigned[b, node].item()):
-                        continue
-
-                    candidate = current_group + [node]
-                    if self._group_feasible(
-                        candidate,
-                        size[b],
-                        build_limit[b],
-                        isstandard[b],
-                        mat_var[b],
-                        maint_diff[b],
-                        rel_motion[b],
-                        assembly_adj[b],
-                    ):
-                        feasible_part[b, node] = True
-
-                if self.allow_fallback and not bool(feasible_part[b, 1:].any().item()):
-                    for node in range(1, N):
-                        if not bool(valid_part_mask[b, node].item()):
-                            continue
-                        if not bool(assigned[b, node].item()):
-                            fallback_part_mask[b, node] = True
-                    feasible_part[b] = fallback_part_mask[b]
-
-            mask = feasible_part
-
-            group_card = open_group[:, 1:].sum(dim=-1)
-            sep_allowed = open_any & (group_card >= self.min_group_size_before_sep)
-            sep_allowed = sep_allowed | (open_any & (~mask[:, 1:].any(dim=-1)))
-            mask[:, 0] = sep_allowed
-
-        # --------------------------
-        # Case 2: no open group
-        # --------------------------
-        no_open_rows = ~open_any
-        if no_open_rows.any():
-            rows = torch.where(no_open_rows)[0]
-            for b in rows.tolist():
-                for node in range(1, N):
-                    if not bool(valid_part_mask[b, node].item()):
-                        continue
-                    if bool(assigned[b, node].item()):
-                        continue
-                    if self._group_feasible(
-                        [node],
-                        size[b],
-                        build_limit[b],
-                        isstandard[b],
-                        mat_var[b],
-                        maint_diff[b],
-                        rel_motion[b],
-                        assembly_adj[b],
-                    ):
-                        mask[b, node] = True
-                mask[b, 0] = False
-
-        # --------------------------
-        # finished cases
-        # --------------------------
-        finished_but_open = all_assigned & open_any
-        if finished_but_open.any():
-            rows = torch.where(finished_but_open)[0]
-            mask[rows] = False
-            mask[rows, 0] = True
-
-        finished_and_closed = all_assigned & (~open_any)
-        if finished_and_closed.any():
-            rows = torch.where(finished_and_closed)[0]
-            mask[rows] = False
-            mask[rows, 0] = True
-
-        td["fallback_part_mask"] = fallback_part_mask
         return mask
 
     def step(self, td: TensorDict, action: torch.Tensor) -> TensorDict:
         B = td.batch_size[0]
         action = action.long().view(B)
 
-        assigned = td["assigned"].clone()
-        open_group = td["open_group"].clone()
-        open_group_size = td["open_group_size"].clone()
-        closed_group_count = td["closed_group_count"].clone()
-        size = td["size"]
-        valid_part_mask = td.get("valid_part_mask", torch.ones_like(assigned))
-
-        is_sep = action.eq(0)
-        is_part = ~is_sep
-
-        # SEP
-        if is_sep.any():
-            rows = torch.where(is_sep)[0]
-            had_open = open_group[rows].any(dim=-1)
-            closed_group_count[rows] += had_open.long()
-            open_group[rows] = False
-            open_group_size[rows] = 0.0
-
-        # PART
-        if is_part.any():
-            rows = torch.where(is_part)[0]
-            idx = action[is_part]
-            assigned[rows, idx] = True
-            open_group[rows, idx] = True
-            open_group_size[rows] += size[rows, idx, :]
-
-        all_assigned = (assigned[:, 1:] | (~valid_part_mask[:, 1:])).all(dim=-1)
-        open_empty = ~open_group.any(dim=-1)
-        done = (all_assigned & open_empty).view(B, 1)
+        group_id = td["group_id"].clone()
+        done = td["done"].clone()
 
         td2 = td.clone()
-        td2.update(
-            {
-                "assigned": assigned,
-                "open_group": open_group,
-                "open_group_size": open_group_size,
-                "closed_group_count": closed_group_count,
-            }
-        )
+        for b in range(B):
+            if bool(done[b].item()):
+                continue
+            a = int(action[b].item())
+            if a == 0:
+                done[b, 0] = True
+                continue
+            if 1 <= a <= len(self.group_pair_list):
+                ga, gb = self.group_pair_list[a - 1]
+                group_id[b, group_id[b] == gb] = ga
+
+        td2["group_id"] = group_id
 
         td2["action_mask"] = self.get_action_mask(td2)
-        dead_end = self._compute_dead_end(assigned, open_group, td2["action_mask"])
-        td2["dead_end"] = dead_end
-        td2["done"] = done | dead_end
+        no_feasible_merge = ~td2["action_mask"][:, 1:].any(dim=-1, keepdim=True)
+        td2["dead_end"] = torch.zeros_like(done)
+        td2["done"] = done | no_feasible_merge
         return td2
 
     def reward_from_actions(self, actions: torch.Tensor) -> torch.Tensor:
@@ -250,29 +168,35 @@ class PartConsolidationEnv:
         groups = self.actions_to_groups(actions, N=self.N)
         return self._terminal_reward_components(groups, device=actions.device)
 
-    @staticmethod
-    def actions_to_groups(actions: torch.Tensor, N: int) -> list[list[list[int]]]:
+    def actions_to_groups(self, actions: torch.Tensor, N: int | None = None) -> list[list[list[int]]]:
+        if self._reward_static_td is None:
+            raise RuntimeError("actions_to_groups called before env.reset")
         B, T = actions.shape
+        td = self._reward_static_td
+        valid_part_mask = td.get("valid_part_mask", torch.ones((B, self.N), dtype=torch.bool, device=actions.device))
         out = []
 
         for b in range(B):
-            groups_b = []
-            cur = []
-            used = set()
+            group_id = torch.full((self.N,), -1, dtype=torch.long, device=actions.device)
+            for node in range(1, self.N):
+                if bool(valid_part_mask[b, node].item()):
+                    group_id[node] = node - 1
 
             for t in range(T):
                 a = int(actions[b, t].item())
                 if a == 0:
-                    if cur:
-                        groups_b.append(cur)
-                        cur = []
-                else:
-                    if 0 < a < N and a not in used:
-                        cur.append(a)
-                        used.add(a)
+                    break
+                if 1 <= a <= len(self.group_pair_list):
+                    ga, gb = self.group_pair_list[a - 1]
+                    if bool((group_id == ga).any().item()) and bool((group_id == gb).any().item()):
+                        group_id[group_id == gb] = ga
 
-            if cur:
-                groups_b.append(cur)
+            groups_map: dict[int, list[int]] = {}
+            for node in range(1, self.N):
+                gid = int(group_id[node].item())
+                if gid >= 0:
+                    groups_map.setdefault(gid, []).append(node)
+            groups_b = [sorted(group) for group in groups_map.values()]
             out.append(groups_b)
 
         return out
@@ -382,14 +306,11 @@ class PartConsolidationEnv:
 
     def _compute_dead_end(
         self,
-        assigned: torch.Tensor,
-        open_group: torch.Tensor,
-        action_mask: torch.Tensor,
+        *args,
     ) -> torch.Tensor:
-        all_assigned = assigned[:, 1:].all(dim=-1, keepdim=True)
-        has_open = open_group.any(dim=-1, keepdim=True)
+        action_mask = args[-1]
         has_valid_action = action_mask.any(dim=-1, keepdim=True)
-        return (~all_assigned) & (~has_open) & (~has_valid_action)
+        return ~has_valid_action
 
     def _group_feasible(
         self,

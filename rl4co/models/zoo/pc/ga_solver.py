@@ -30,7 +30,7 @@ class GASolver:
         generations: int = 300,
         elite_size: int = 0,
         tournament_size: int = 2,
-        mutation_rate: float = 0.05,
+        mutation_rate: float = 0.10,
         init_new_group_bias: float = 0.60,
         enable_post_merge_repair: bool = False,
         exploratory_crossover_prob: float = 0.25,
@@ -61,6 +61,8 @@ class GASolver:
         self.last_generation_parent_child_mean_similarity: list[float] = []
         self.last_generation_parent_child_examples: list[list[dict]] = []
         self.score_weights = None
+        self._edge_list: list[tuple[int, int]] = []
+        self._num_parts: int = 0
 
     @staticmethod
     def _pop_size_for_num_parts(n: int) -> int:
@@ -86,6 +88,8 @@ class GASolver:
     def solve(self, inst):
         start = time.time()
         n = int(inst["num_parts"])
+        self._num_parts = n
+        self._edge_list = self._build_edge_list(inst)
         effective_pop_size = max(1, self.pop_size)
         effective_elite_size = min(max(0, self.elite_size), effective_pop_size)
         toolbox = self._build_toolbox(inst, n)
@@ -202,6 +206,11 @@ class GASolver:
         else:
             sol = self._random_solution(inst)
         return creator.PCIndividual(sol.tolist())
+
+    def _build_edge_list(self, inst) -> list[tuple[int, int]]:
+        adj = np.asarray(inst["assembly_adj"]).astype(bool)
+        n = int(inst["num_parts"])
+        return [(i, j) for i in range(n) for j in range(i + 1, n) if bool(adj[i, j])]
 
     def _evaluate_invalid(self, pop, toolbox) -> None:
         invalid = [ind for ind in pop if not ind.fitness.valid]
@@ -359,20 +368,12 @@ class GASolver:
         return self._encode(groups, n)
 
     def _random_solution_diverse(self, inst) -> np.ndarray:
-        n = int(inst["num_parts"])
-        groups: list[list[int]] = []
-        order = list(range(n))
-        self.rng.shuffle(order)
-
-        for node in order:
-            if not groups or self.rng.random() < 0.55:
-                groups.append([node])
-                continue
-
-            target_idx = self.rng.randrange(len(groups))
-            groups[target_idx].append(node)
-
-        sol = self._encode(groups, n)
+        if not self._edge_list:
+            return np.zeros((0,), dtype=int)
+        sol = np.asarray(
+            [1 if self.rng.random() < 0.50 else 0 for _ in self._edge_list],
+            dtype=int,
+        )
         repaired = self._repair(self._canonicalize(sol), inst)
         if self._solution_feasible(repaired, inst):
             return repaired
@@ -441,9 +442,9 @@ class GASolver:
                 )
 
     def _grouping_pairwise_similarity(self, a: np.ndarray, b: np.ndarray) -> float:
-        a = self._canonicalize(self._as_array(a))
-        b = self._canonicalize(self._as_array(b))
-        n = len(a)
+        labels_a = self._group_labels(self._decode(self._canonicalize(self._as_array(a))))
+        labels_b = self._group_labels(self._decode(self._canonicalize(self._as_array(b))))
+        n = self._num_parts
         if n <= 1:
             return 1.0
 
@@ -451,11 +452,18 @@ class GASolver:
         total = 0
         for i in range(n):
             for j in range(i + 1, n):
-                same_a = int(a[i]) == int(a[j])
-                same_b = int(b[i]) == int(b[j])
+                same_a = labels_a[i] == labels_a[j]
+                same_b = labels_b[i] == labels_b[j]
                 same += int(same_a == same_b)
                 total += 1
         return same / max(total, 1)
+
+    def _group_labels(self, groups: list[list[int]]) -> list[int]:
+        labels = [-1] * self._num_parts
+        for gid, group in enumerate(groups):
+            for node in group:
+                labels[int(node)] = gid
+        return labels
 
     def save_parent_child_similarity_examples(
         self,
@@ -504,153 +512,120 @@ class GASolver:
         return penalty
 
     def _decode(self, sol: np.ndarray) -> list[list[int]]:
-        groups = {}
-        for i, g in enumerate(sol):
-            groups.setdefault(int(g), []).append(i)
+        n = self._num_parts
+        parent = list(range(n))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        z = self._as_array(sol)
+        for bit, (u, v) in zip(z, self._edge_list):
+            if int(bit) == 1:
+                union(u, v)
+
+        groups: dict[int, list[int]] = {}
+        for node in range(n):
+            groups.setdefault(find(node), []).append(node)
         return [sorted(group) for group in groups.values()]
 
-    def _encode(self, groups: list[list[int]], n: int) -> np.ndarray:
-        sol = np.empty(n, dtype=int)
+    def _encode(self, groups: list[list[int]], n: int | None = None) -> np.ndarray:
+        group_id: dict[int, int] = {}
         for gid, group in enumerate(groups):
             for node in group:
-                sol[node] = gid
-        return sol
+                group_id[int(node)] = gid
+        return np.asarray(
+            [1 if group_id.get(u) == group_id.get(v) else 0 for u, v in self._edge_list],
+            dtype=int,
+        )
 
     def _canonicalize(self, sol: np.ndarray) -> np.ndarray:
-        mapping = {}
-        next_gid = 0
-        out = np.empty_like(sol)
-        for i, gid in enumerate(sol):
-            gid = int(gid)
-            if gid not in mapping:
-                mapping[gid] = next_gid
-                next_gid += 1
-            out[i] = mapping[gid]
-        return out
+        return self._encode(self._decode(self._as_array(sol)), self._num_parts)
 
     def _crossover(self, p1: np.ndarray, p2: np.ndarray, n: int, inst) -> np.ndarray:
-        if self.rng.random() < self.exploratory_crossover_prob:
-            return self._crossover_exploratory(p1, p2, n)
-        return self._crossover_feasible_aware(p1, p2, n, inst)
+        return self._crossover_component_injection(p1, p2, n, inst)
 
-    def _crossover_exploratory(self, p1: np.ndarray, p2: np.ndarray, n: int) -> np.ndarray:
-        child = p1.copy()
-        parent2_groups = self._decode(p2)
-        self.rng.shuffle(parent2_groups)
+    def _crossover_component_injection(self, p1: np.ndarray, p2: np.ndarray, n: int, inst) -> np.ndarray:
+        child_groups = [group[:] for group in self._decode(self._canonicalize(p1))]
+        donor_groups = [group[:] for group in self._decode(self._canonicalize(p2))]
+        if not donor_groups:
+            return self._canonicalize(p1)
 
-        # Inherit a few entire groups from parent 2.
-        take_k = max(1, len(parent2_groups) // 2)
-        selected = parent2_groups[:take_k]
-        for group in selected:
-            new_gid = int(child.max()) + 1 if child.size > 0 else 0
-            for node in group:
-                child[node] = new_gid
+        injected = sorted(self.rng.choice(donor_groups))
+        injected_set = set(injected)
+        next_groups: list[list[int]] = []
+        for group in child_groups:
+            remaining = [node for node in group if node not in injected_set]
+            if remaining:
+                next_groups.append(sorted(remaining))
+        next_groups.append(injected)
 
-        # Also align some nodes to parent 2 directly.
-        for node in range(n):
-            if self.rng.random() < 0.2:
-                target_group = p2[node]
-                members = np.where(p2 == target_group)[0]
-                new_gid = int(child.max()) + 1
-                child[members] = new_gid
-
-        return self._canonicalize(child)
-
-    def _crossover_feasible_aware(self, p1: np.ndarray, p2: np.ndarray, n: int, inst) -> np.ndarray:
-        parent1_groups = self._decode(p1)
-        parent2_groups = self._decode(p2)
-        pool = [group[:] for group in parent1_groups] + [group[:] for group in parent2_groups]
-        self.rng.shuffle(pool)
-
-        child_groups: list[list[int]] = []
-        assigned: set[int] = set()
-
-        for group in pool:
-            candidate = [node for node in group if node not in assigned]
-            if not candidate:
-                continue
-            if len(candidate) == 1:
-                child_groups.append(candidate)
-                assigned.update(candidate)
-                continue
-
-            # Try the whole inherited group first.
-            if self._group_feasible(candidate, inst):
-                child_groups.append(sorted(candidate))
-                assigned.update(candidate)
-                continue
-
-            # If the full group is infeasible, greedily keep a feasible subset.
-            feasible_subset: list[int] = []
-            for node in candidate:
-                trial = sorted(feasible_subset + [node])
-                if self._group_feasible(trial, inst):
-                    feasible_subset = trial
-            if feasible_subset:
-                child_groups.append(feasible_subset)
-                assigned.update(feasible_subset)
-
-        remaining = [node for node in range(n) if node not in assigned]
-        self.rng.shuffle(remaining)
-        for node in remaining:
-            feasible_targets = []
-            for idx, group in enumerate(child_groups):
-                trial = sorted(group + [node])
-                if self._group_feasible(trial, inst):
-                    feasible_targets.append(idx)
-            if feasible_targets and self.rng.random() >= self.init_new_group_bias:
-                target_idx = self.rng.choice(feasible_targets)
-                child_groups[target_idx].append(node)
-                child_groups[target_idx].sort()
-            else:
-                child_groups.append([node])
-
-        return self._canonicalize(self._encode(child_groups, n))
+        return self._canonicalize(self._encode(next_groups, n))
 
     def _mutate(self, sol: np.ndarray, inst) -> np.ndarray:
-        child = sol.copy()
-
-        if self.rng.random() < self.exploratory_mutation_prob:
-            return self._mutate_relaxed(child)
-
-        feasible_candidates = self._collect_feasible_mutation_candidates(child, inst)
-        valid_ops = [op for op, candidates in feasible_candidates.items() if candidates]
-        if not valid_ops:
-            return self._mutate_relaxed(child)
-
-        op = self.rng.choice(valid_ops)
-        return self.rng.choice(feasible_candidates[op])
+        child = self._canonicalize(sol.copy())
+        op = self.rng.choice(["split", "merge"])
+        if op == "split":
+            return self._mutate_split_edges(child, inst)
+        return self._mutate_merge_edges(child, inst)
 
     def _mutate_relaxed(self, sol: np.ndarray) -> np.ndarray:
         child = self._canonicalize(sol.copy())
-        groups = self._decode(child)
-        n = len(child)
-        op = self.rng.choice(["move", "merge", "split"])
-
-        if op == "move" and len(groups) >= 2:
-            node = self.rng.randrange(n)
-            current_gid = int(child[node])
-            candidate_gids = [gid for gid in range(len(groups)) if gid != current_gid]
-            if candidate_gids:
-                child[node] = self.rng.choice(candidate_gids)
-                return self._canonicalize(child)
-
-        if op == "merge" and len(groups) >= 2:
-            gid_a, gid_b = sorted(self.rng.sample(range(len(groups)), 2))
-            for node in groups[gid_b]:
-                child[node] = gid_a
-            return self._canonicalize(child)
-
-        large_groups = [group for group in groups if len(group) >= 2]
-        if large_groups:
-            group = self.rng.choice(large_groups)
-            cut = self.rng.randrange(1, len(group))
-            new_gid = int(child.max()) + 1
-            for node in group[cut:]:
-                child[node] = new_gid
-            return self._canonicalize(child)
-
+        if len(child) == 0:
+            return child
+        idx = self.rng.randrange(len(child))
+        child[idx] = 1 - int(child[idx])
         return child
+
+    def _mutate_split_edges(self, sol: np.ndarray, inst) -> np.ndarray:
+        base = self._canonicalize(sol)
+        base_group_count = len(self._decode(base))
+        groups = [group for group in self._decode(base) if len(group) >= 2]
+        if not groups:
+            return base
+
+        selected_group = set(self.rng.choice(groups))
+        candidates = []
+        for edge_idx, (u, v) in enumerate(self._edge_list):
+            if int(base[edge_idx]) == 1 and u in selected_group and v in selected_group:
+                candidates.append(edge_idx)
+        self.rng.shuffle(candidates)
+
+        child = base.copy()
+        for edge_idx in candidates:
+            child[edge_idx] = 0
+            canonical = self._canonicalize(child)
+            if len(self._decode(canonical)) > base_group_count:
+                return canonical
+        return base
+
+    def _mutate_merge_edges(self, sol: np.ndarray, inst) -> np.ndarray:
+        base = self._canonicalize(sol)
+        base_group_count = len(self._decode(base))
+        if base_group_count <= 1:
+            return base
+
+        labels = self._group_labels(self._decode(base))
+        candidates = []
+        for edge_idx, (u, v) in enumerate(self._edge_list):
+            if int(base[edge_idx]) == 0 and labels[u] != labels[v]:
+                candidates.append(edge_idx)
+        self.rng.shuffle(candidates)
+
+        child = base.copy()
+        for edge_idx in candidates:
+            child[edge_idx] = 1
+            canonical = self._canonicalize(child)
+            if len(self._decode(canonical)) < base_group_count:
+                return canonical
+        return base
 
     def _collect_feasible_mutation_candidates(self, sol: np.ndarray, inst) -> dict[str, list[np.ndarray]]:
         child = self._canonicalize(sol.copy())

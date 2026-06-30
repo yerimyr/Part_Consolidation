@@ -22,7 +22,6 @@ from tensordict import TensorDict
 from rl4co.envs.pc.env import PartConsolidationEnv
 from rl4co.envs.pc.evaluator import evaluate_groups
 from rl4co.envs.pc.evaluator import score_metric_rows_by_group
-from rl4co.envs.pc.fixed_instance_benchmark import create_fixed_instance
 from rl4co.envs.pc.generator import FPIGenerator
 from rl4co.models.zoo.pc.cpccd_solver import CPCCDSolver
 from rl4co.models.zoo.pc.ga_solver import GASolver
@@ -145,34 +144,10 @@ def visualize_grouping_solution(inst, groups, method, output_path, metrics=None)
     plt.close(fig)
 
 
-def actions_to_groups(actions):
-    groups = []
-    current = []
-    used = set()
-
-    for a in actions:
-        a = int(a)
-        if a == 0:
-            if current:
-                groups.append(current)
-                current = []
-        else:
-            part_idx = a - 1
-            if part_idx not in used:
-                current.append(part_idx)
-                used.add(part_idx)
-
-    if current:
-        groups.append(current)
-
-    return groups
-
-
 def run_nco(env, policy, td, max_steps=None):
     start = time.time()
     td = td.clone().to(env.device)
-    actions = []
-    max_steps = max_steps or (env.generator.num_parts * 2 + 4)
+    max_steps = max_steps or env.max_parts
 
     policy.eval()
     with torch.no_grad():
@@ -180,10 +155,19 @@ def run_nco(env, policy, td, max_steps=None):
             if td["done"].all():
                 break
             action, _, _, _ = policy.act(td, sample=False, epsilon=0.0)
-            actions.append(int(action[0].item()))
             td = env.step(td, action)
 
-    groups = actions_to_groups(actions)
+    groups_by_gid = {}
+    group_id = td["group_id"][0]
+    valid_part_mask = td.get("valid_part_mask", group_id.ge(0).unsqueeze(0))[0]
+    node_count = group_id.shape[0]
+    for node in range(1, node_count):
+        if not bool(valid_part_mask[node].item()):
+            continue
+        gid = int(group_id[node].item())
+        if gid >= 0:
+            groups_by_gid.setdefault(gid, []).append(node - 1)
+    groups = [sorted(group) for group in groups_by_gid.values()]
     return groups, time.time() - start
 
 
@@ -295,11 +279,9 @@ def inst_to_td(inst, env):
     compat_all[:, 1:, 1:] = compat.unsqueeze(0)
     relation_valid_all[:, 1:, 1:] = relation_valid.unsqueeze(0)
 
-    assigned = torch.zeros((1, num_nodes), dtype=torch.bool, device=device)
-    assigned[:, 0] = True
-    open_group = torch.zeros((1, num_nodes), dtype=torch.bool, device=device)
-    open_group_size = torch.zeros((1, 3), dtype=torch.float32, device=device)
-    closed_group_count = torch.zeros((1,), dtype=torch.long, device=device)
+    group_id = torch.full((1, num_nodes), -1, dtype=torch.long, device=device)
+    for node in range(1, num_nodes):
+        group_id[:, node] = node - 1
 
     td = TensorDict(
         {
@@ -320,20 +302,15 @@ def inst_to_td(inst, env):
             "relation_valid": relation_valid_all,
             "relation_consistent": torch.tensor([bool(inst.get("relation_consistent", True))], dtype=torch.bool, device=device),
             "build_limit": build_limit.unsqueeze(0),
-            "assigned": assigned,
-            "open_group": open_group,
-            "open_group_size": open_group_size,
-            "closed_group_count": closed_group_count,
+            "group_id": group_id,
             "fallback_part_mask": torch.zeros((1, num_nodes), dtype=torch.bool, device=device),
             "dead_end": torch.zeros((1, 1), dtype=torch.bool, device=device),
             "done": torch.zeros((1, 1), dtype=torch.bool, device=device),
-            "action_mask": torch.ones((1, num_nodes), dtype=torch.bool, device=device),
+            "action_mask": torch.ones((1, env.num_actions), dtype=torch.bool, device=device),
         },
         batch_size=[1],
     )
     td["action_mask"] = env.get_action_mask(td)
-    td["dead_end"] = env._compute_dead_end(td["assigned"], td["open_group"], td["action_mask"])
-    td["done"] = td["done"] | td["dead_end"]
     return td
 
 
@@ -532,15 +509,26 @@ def summarize_result_rows(rows, label):
     return scored_rows, summary
 
 
-def run_fixed(env, policy):
-    inst = create_fixed_instance(
-        num_parts=env.generator.min_num_parts,
-        material_types=env.generator.p.material_types,
-    )
-    inst["num_parts"] = int(env.generator.min_num_parts)
+def make_seeded_fixed_td(env, seed: int):
+    cpu_rng_state = torch.random.get_rng_state()
+    cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
+
+    try:
+        torch.manual_seed(seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(seed)
+        return env.reset(batch_size=1)
+    finally:
+        torch.random.set_rng_state(cpu_rng_state)
+        if cuda_rng_states is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_states)
+
+
+def run_fixed(env, policy, fixed_seed=42):
+    td = make_seeded_fixed_td(env, seed=fixed_seed)
+    inst = td_to_inst(td, env.generator.num_parts)
     print_instance(inst, "FIXED INSTANCE USED IN THE EXPERIMENT")
     proxy = compute_search_space_proxy(inst)
-    td = inst_to_td(inst, env)
 
     cpccd = CPCCDSolver()
     ga = GASolver()
@@ -940,8 +928,8 @@ def main():
         num_parts=4,
         max_num_parts=20,
         material_types=2,
-        p_relative_motion=0.03,
-        p_extra_edge=0.80,
+        p_relative_motion=0.10,
+        p_extra_edge=0.50,
         L_low=20.0,
         L_high=120.0,
         W_low=10.0,
@@ -951,17 +939,18 @@ def main():
         build_limit_L=1000.0,
         build_limit_W=1000.0,
         build_limit_H=500.0,
-        p_maint_H=0.02,
-        p_standard=0.01,
+        p_maint_H=0.10,
+        p_standard=0.10,
     )
 
     gen = FPIGenerator(**generator_params)
     env = PartConsolidationEnv(generator=gen, device=device)
+    fixed_seed = 2
     ckpt = Path("checkpoints") / "best_model.pt"
     policy = load_policy(gen, device, ckpt)
 
     print("\n===== FIXED INSTANCE EXPERIMENT =====")
-    fixed_inst, fixed_results = run_fixed(env, policy)
+    fixed_inst, fixed_results = run_fixed(env, policy, fixed_seed=fixed_seed)
     df_fixed, summary_fixed = save_results(fixed_results, "fixed_results.csv")
     for row in summary_fixed:
         print(row)
@@ -970,7 +959,7 @@ def main():
     gen_results = run_generalization(
         env,
         policy,
-        num_instances=500,
+        num_instances=10,
         min_parts=generator_params["num_parts"],
         max_parts=generator_params["max_num_parts"],
     )

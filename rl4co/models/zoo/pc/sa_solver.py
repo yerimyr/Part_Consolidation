@@ -14,9 +14,8 @@ class SASolver:
     """
     Simulated annealing baseline for part consolidation.
 
-    A solution is encoded as a length-N chromosome:
-    [0, 0, 1, 2] means parts 0 and 1 are in group 0, part 2 is in
-    group 1, and part 3 is in group 2.
+    Internally, a solution is encoded as an edge-based chromosome Z over the
+    physical edge set. z_l = 1 keeps edge e_l, and z_l = 0 cuts it.
     """
 
     def __init__(
@@ -43,9 +42,13 @@ class SASolver:
         self.last_best_scores: list[float] = []
         self.last_temperatures: list[float] = []
         self.last_acceptance_flags: list[int] = []
+        self._edge_list: list[tuple[int, int]] = []
+        self._num_parts: int = 0
 
     def solve(self, inst):
         start = time.time()
+        self._num_parts = int(inst["num_parts"])
+        self._edge_list = self._build_edge_list(inst)
         current = self._initial_solution(inst)
         current_score = self._fitness(current, inst)
         best = current.copy()
@@ -80,63 +83,110 @@ class SASolver:
         self.last_best_score = best_score
         return self._decode(best), time.time() - start
 
-    def _initial_solution(self, inst) -> np.ndarray:
+    def _build_edge_list(self, inst) -> list[tuple[int, int]]:
+        adj = np.asarray(inst["assembly_adj"]).astype(bool)
         n = int(inst["num_parts"])
-        groups: list[list[int]] = []
-        nodes = list(range(n))
-        self.rng.shuffle(nodes)
+        return [(i, j) for i in range(n) for j in range(i + 1, n) if bool(adj[i, j])]
 
-        for node in nodes:
-            if not groups or self.rng.random() < 0.55:
-                groups.append([node])
-                continue
-            target_idx = self.rng.randrange(len(groups))
-            groups[target_idx].append(node)
-
-        repaired = self._repair(self._encode(groups, n), inst)
+    def _initial_solution(self, inst) -> np.ndarray:
+        if not self._edge_list:
+            return np.zeros((0,), dtype=int)
+        sol = np.asarray(
+            [1 if self.rng.random() < 0.50 else 0 for _ in self._edge_list],
+            dtype=int,
+        )
+        repaired = self._repair(self._canonicalize(sol), inst)
         if self._solution_feasible(repaired, inst):
             return self._canonicalize(repaired)
-        return np.arange(n, dtype=int)
+        return np.zeros((len(self._edge_list),), dtype=int)
 
     def _neighbor(self, sol: np.ndarray, inst) -> np.ndarray:
         child = self._canonicalize(sol.copy())
-        groups = self._decode(child)
-        n = len(child)
-        op = self.rng.choice(["swap", "relocation", "merge", "split"])
-
-        if op == "swap" and n >= 2:
-            i, j = self.rng.sample(range(n), 2)
-            child[i], child[j] = child[j], child[i]
-
-        elif op == "relocation" and n >= 1:
-            node = self.rng.randrange(n)
-            current_gid = int(child[node])
-            target_gids = [gid for gid in range(len(groups)) if gid != current_gid]
-            if self.rng.random() < 0.25 or not target_gids:
-                target_gid = int(child.max()) + 1
-            else:
-                target_gid = self.rng.choice(target_gids)
-            child[node] = target_gid
-
-        elif op == "merge" and len(groups) >= 2:
-            gid_a, gid_b = sorted(self.rng.sample(range(len(groups)), 2))
-            for node in groups[gid_b]:
-                child[node] = gid_a
-
-        elif op == "split":
-            splittable = [group for group in groups if len(group) >= 2]
-            if splittable:
-                group = list(self.rng.choice(splittable))
-                self.rng.shuffle(group)
-                cut = self.rng.randrange(1, len(group))
-                new_gid = int(child.max()) + 1
-                for node in group[cut:]:
-                    child[node] = new_gid
+        op = self.rng.choice(["split", "merge", "swap", "relocation"])
+        if op == "split":
+            child = self._neighbor_split_edge(child, inst)
+        elif op == "merge":
+            child = self._neighbor_merge_edge(child, inst)
+        elif op == "swap":
+            child = self._neighbor_swap(child)
+        else:
+            child = self._neighbor_relocation(child)
 
         repaired = self._repair(self._canonicalize(child), inst)
         if self._solution_feasible(repaired, inst):
             return self._canonicalize(repaired)
         return self._canonicalize(sol)
+
+    def _neighbor_split_edge(self, sol: np.ndarray, inst) -> np.ndarray:
+        base = self._canonicalize(sol)
+        base_group_count = len(self._decode(base))
+        groups = [group for group in self._decode(base) if len(group) >= 2]
+        if not groups:
+            return base
+
+        selected_group = set(self.rng.choice(groups))
+        candidates = []
+        for edge_idx, (u, v) in enumerate(self._edge_list):
+            if int(base[edge_idx]) == 1 and u in selected_group and v in selected_group:
+                candidates.append(edge_idx)
+        self.rng.shuffle(candidates)
+
+        child = base.copy()
+        for edge_idx in candidates:
+            child[edge_idx] = 0
+            canonical = self._canonicalize(child)
+            if len(self._decode(canonical)) > base_group_count:
+                return canonical
+        return base
+
+    def _neighbor_merge_edge(self, sol: np.ndarray, inst) -> np.ndarray:
+        base = self._canonicalize(sol)
+        base_group_count = len(self._decode(base))
+        if base_group_count <= 1:
+            return base
+
+        labels = self._group_labels(self._decode(base))
+        candidates = []
+        for edge_idx, (u, v) in enumerate(self._edge_list):
+            if int(base[edge_idx]) == 0 and labels[u] != labels[v]:
+                candidates.append(edge_idx)
+        self.rng.shuffle(candidates)
+
+        child = base.copy()
+        for edge_idx in candidates:
+            child[edge_idx] = 1
+            canonical = self._canonicalize(child)
+            if len(self._decode(canonical)) < base_group_count:
+                return canonical
+        return base
+
+    def _neighbor_swap(self, sol: np.ndarray) -> np.ndarray:
+        groups = self._decode(self._canonicalize(sol))
+        labels = self._group_labels(groups)
+        candidates = [node for node, gid in enumerate(labels) if gid >= 0]
+        if len(candidates) < 2:
+            return sol
+        a, b = self.rng.sample(candidates, 2)
+        labels[a], labels[b] = labels[b], labels[a]
+        return self._canonicalize(self._encode(self._labels_to_groups(labels)))
+
+    def _neighbor_relocation(self, sol: np.ndarray) -> np.ndarray:
+        groups = self._decode(self._canonicalize(sol))
+        labels = self._group_labels(groups)
+        movable = [node for node, gid in enumerate(labels) if gid >= 0]
+        active_gids = sorted({gid for gid in labels if gid >= 0})
+        if not movable:
+            return sol
+
+        node = self.rng.choice(movable)
+        current_gid = labels[node]
+        target_gids = [gid for gid in active_gids if gid != current_gid]
+        if self.rng.random() < 0.25 or not target_gids:
+            target_gid = max(active_gids, default=-1) + 1
+        else:
+            target_gid = self.rng.choice(target_gids)
+        labels[node] = target_gid
+        return self._canonicalize(self._encode(self._labels_to_groups(labels)))
 
     def _repair(self, sol: np.ndarray, inst) -> np.ndarray:
         groups = self._decode(self._canonicalize(sol))
@@ -157,7 +207,7 @@ class SASolver:
 
         if self.enable_post_merge_repair:
             repaired = self._post_merge_repair(repaired, inst)
-        return self._canonicalize(self._encode(repaired, len(sol)))
+        return self._canonicalize(self._encode(repaired))
 
     def _post_merge_repair(self, groups: list[list[int]], inst) -> list[list[int]]:
         repaired = [group[:] for group in groups]
@@ -187,29 +237,60 @@ class SASolver:
         return float(score_metric_rows([metrics], weights=self.score_weights)[0]["score"])
 
     def _decode(self, sol: np.ndarray) -> list[list[int]]:
-        groups = {}
-        for i, gid in enumerate(sol):
-            groups.setdefault(int(gid), []).append(i)
+        parent = list(range(self._num_parts))
+
+        def find(x: int) -> int:
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(a: int, b: int) -> None:
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[rb] = ra
+
+        z = self._as_array(sol)
+        for bit, (u, v) in zip(z, self._edge_list):
+            if int(bit) == 1:
+                union(u, v)
+
+        groups: dict[int, list[int]] = {}
+        for node in range(self._num_parts):
+            groups.setdefault(find(node), []).append(node)
         return [sorted(group) for group in groups.values()]
 
-    def _encode(self, groups: list[list[int]], n: int) -> np.ndarray:
-        sol = np.empty(n, dtype=int)
+    def _encode(self, groups: list[list[int]]) -> np.ndarray:
+        group_id: dict[int, int] = {}
         for gid, group in enumerate(groups):
             for node in group:
-                sol[node] = gid
-        return sol
+                group_id[int(node)] = gid
+        return np.asarray(
+            [1 if group_id.get(u) == group_id.get(v) else 0 for u, v in self._edge_list],
+            dtype=int,
+        )
 
     def _canonicalize(self, sol: np.ndarray) -> np.ndarray:
-        mapping = {}
-        next_gid = 0
-        out = np.empty_like(sol)
-        for i, gid in enumerate(sol):
-            gid = int(gid)
-            if gid not in mapping:
-                mapping[gid] = next_gid
-                next_gid += 1
-            out[i] = mapping[gid]
-        return out
+        return self._encode(self._decode(self._as_array(sol)))
+
+    def _as_array(self, sol) -> np.ndarray:
+        if isinstance(sol, np.ndarray):
+            return sol.astype(int, copy=True)
+        return np.asarray(list(sol), dtype=int)
+
+    def _group_labels(self, groups: list[list[int]]) -> list[int]:
+        labels = [-1] * self._num_parts
+        for gid, group in enumerate(groups):
+            for node in group:
+                labels[int(node)] = gid
+        return labels
+
+    def _labels_to_groups(self, labels: list[int]) -> list[list[int]]:
+        groups: dict[int, list[int]] = {}
+        for node, gid in enumerate(labels):
+            if gid >= 0:
+                groups.setdefault(int(gid), []).append(node)
+        return [sorted(group) for group in groups.values()]
 
     def _solution_feasible(self, sol: np.ndarray, inst) -> bool:
         groups = self._decode(self._canonicalize(sol))
