@@ -38,14 +38,17 @@ def rollout_episode_from_td(
     actions = []
     logps = []
     entropies = []
+    step_counts = torch.zeros((td.batch_size[0],), dtype=torch.float32, device=env.device)
 
     for _ in range(max_steps):
+        active = ~td["done"].view(-1)
         action, logp, entropy, _ = policy.act(td, sample=sample, epsilon=epsilon)
         actions.append(action)
         logps.append(logp)
         entropies.append(entropy)
 
         td = env.step(td, action)
+        step_counts = step_counts + active.float()
 
         if td["done"].all():
             break
@@ -57,7 +60,7 @@ def rollout_episode_from_td(
     terminal_reward = env.reward_from_actions(actions)
     total_reward = terminal_reward
 
-    return actions, logps, entropies, terminal_reward, total_reward, td
+    return actions, logps, entropies, terminal_reward, total_reward, td, step_counts
 
 
 def make_fixed_eval_td(
@@ -80,6 +83,244 @@ def make_fixed_eval_td(
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
+def group_feasible_for_instance(env: PartConsolidationEnv, td_static, batch_idx: int, group: list[int]) -> bool:
+    return env._group_feasible(
+        sorted(group),
+        td_static["size"][batch_idx],
+        td_static["build_limit"][batch_idx],
+        td_static["isstandard"][batch_idx],
+        td_static["mat_var"][batch_idx],
+        td_static["maint_diff"][batch_idx],
+        td_static["rel_motion"][batch_idx],
+        td_static["assembly_adj"][batch_idx],
+    )
+
+
+def mutate_grouping_once(env: PartConsolidationEnv, td_static, batch_idx: int, groups: list[list[int]]):
+    groups = [sorted(group) for group in groups if group]
+    if not groups:
+        return None
+
+    ops = ["split", "merge"]
+    random.shuffle(ops)
+
+    for op in ops:
+        if op == "merge" and len(groups) >= 2:
+            pairs = [(i, j) for i in range(len(groups)) for j in range(i + 1, len(groups))]
+            random.shuffle(pairs)
+            for i, j in pairs:
+                merged = sorted(groups[i] + groups[j])
+                if not group_feasible_for_instance(env, td_static, batch_idx, merged):
+                    continue
+                next_groups = [g[:] for k, g in enumerate(groups) if k not in (i, j)]
+                next_groups.append(merged)
+                return [sorted(g) for g in next_groups]
+
+        if op == "split":
+            candidates = [idx for idx, group in enumerate(groups) if len(group) >= 2]
+            random.shuffle(candidates)
+            for idx in candidates:
+                group = groups[idx][:]
+                nodes = group[:]
+                random.shuffle(nodes)
+                for node in nodes:
+                    left = [n for n in group if n != node]
+                    right = [node]
+                    if not left:
+                        continue
+                    if not group_feasible_for_instance(env, td_static, batch_idx, left):
+                        continue
+                    next_groups = [g[:] for k, g in enumerate(groups) if k != idx]
+                    next_groups.extend([sorted(left), right])
+                    return [sorted(g) for g in next_groups]
+
+    return None
+
+
+def reward_for_single_grouping(env: PartConsolidationEnv, td_static, batch_idx: int, groups: list[list[int]]) -> torch.Tensor:
+    old_static_td = env._reward_static_td
+    try:
+        env._reward_static_td = td_static[batch_idx : batch_idx + 1].clone()
+        metrics = env._terminal_reward_components([groups], device=td_static.device)
+        return metrics["Q_gamma"][0]
+    finally:
+        env._reward_static_td = old_static_td
+
+
+def grouping_to_action_sequence(
+    env: PartConsolidationEnv,
+    td_single,
+    groups: list[list[int]],
+    max_steps: int,
+):
+    td = td_single.clone()
+    actions = []
+
+    for group in [sorted(g) for g in groups if len(g) >= 2]:
+        base = group[0]
+        pending = group[1:]
+        while pending:
+            group_id = td["group_id"][0]
+            base_gid = int(group_id[base].item())
+            matched = False
+
+            for node in list(pending):
+                node_gid = int(group_id[node].item())
+                if base_gid < 0 or node_gid < 0 or base_gid == node_gid:
+                    pending.remove(node)
+                    matched = True
+                    break
+
+                pair = tuple(sorted((base_gid, node_gid)))
+                if pair not in env.group_pair_list:
+                    continue
+                action = env.group_pair_list.index(pair) + 1
+                if not bool(td["action_mask"][0, action].item()):
+                    continue
+
+                action_tensor = torch.tensor([action], dtype=torch.long, device=td.device)
+                actions.append(action)
+                td = env.step(td, action_tensor)
+                pending.remove(node)
+                matched = True
+                break
+
+            if not matched:
+                return None
+
+            if len(actions) >= max_steps:
+                return None
+
+    if len(actions) < max_steps:
+        actions.append(0)
+    return actions
+
+
+def logprob_of_action_sequences(
+    env: PartConsolidationEnv,
+    policy: PCPolicy,
+    td_init,
+    action_sequences: list[list[int]],
+) -> torch.Tensor:
+    if not action_sequences:
+        return torch.empty((0,), dtype=torch.float32, device=td_init.device)
+
+    lengths = torch.tensor([len(seq) for seq in action_sequences], dtype=torch.long, device=td_init.device)
+    max_len = int(lengths.max().item())
+    action_tensor = torch.zeros((len(action_sequences), max_len), dtype=torch.long, device=td_init.device)
+    for idx, seq in enumerate(action_sequences):
+        action_tensor[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=td_init.device)
+
+    td = td_init.clone()
+    logp_sum = torch.zeros((len(action_sequences),), dtype=torch.float32, device=td_init.device)
+
+    for t in range(max_len):
+        active = t < lengths
+        if not bool(active.any().item()):
+            break
+
+        node_emb = policy.encode(td)
+        logits = policy.compute_logits(node_emb, td) / policy.temperature
+        mask = td["action_mask"].clone()
+        no_valid = ~mask.any(dim=-1)
+        if no_valid.any():
+            mask[no_valid, 0] = True
+        logits = logits.masked_fill(~mask, -1e9)
+        probs = torch.softmax(logits, dim=-1)
+
+        action = action_tensor[:, t]
+        chosen = probs.gather(1, action.view(-1, 1)).clamp_min(1e-12).squeeze(-1)
+        logp_sum = logp_sum + torch.where(active, torch.log(chosen), torch.zeros_like(logp_sum))
+        td = env.step(td, action)
+
+    return logp_sum
+
+
+def compute_mutation_auxiliary_loss(
+    env: PartConsolidationEnv,
+    policy: PCPolicy,
+    td_static,
+    sampled_actions: torch.Tensor,
+    sampled_reward: torch.Tensor,
+    mutation_frac: float,
+    mutation_attempts: int,
+    max_steps: int,
+):
+    batch_size = sampled_actions.size(0)
+    selected_count = int(round(batch_size * mutation_frac))
+    if selected_count <= 0 or mutation_attempts <= 0:
+        zero = sampled_reward.new_tensor(0.0)
+        return zero, {
+            "applied_ratio": 0.0,
+            "improved_ratio": 0.0,
+            "reward_gain": 0.0,
+            "kept_count": 0,
+        }
+
+    selected_count = min(batch_size, selected_count)
+    selected = torch.randperm(batch_size, device=sampled_actions.device)[:selected_count].tolist()
+    sampled_groups = env.actions_to_groups(sampled_actions, N=env.N)
+
+    kept_indices = []
+    action_sequences = []
+    weights = []
+    gains = []
+
+    with torch.no_grad():
+        for batch_idx in selected:
+            base_groups = sampled_groups[batch_idx]
+            best_groups = None
+            best_gain = sampled_reward.new_tensor(0.0)
+
+            for _ in range(mutation_attempts):
+                mutated = mutate_grouping_once(env, td_static, batch_idx, base_groups)
+                if mutated is None:
+                    continue
+                reward_mut = reward_for_single_grouping(env, td_static, batch_idx, mutated)
+                gain = reward_mut - sampled_reward[batch_idx]
+                if gain > best_gain:
+                    best_gain = gain
+                    best_groups = mutated
+
+            if best_groups is None or best_gain <= 0:
+                continue
+
+            seq = grouping_to_action_sequence(
+                env=env,
+                td_single=td_static[batch_idx : batch_idx + 1],
+                groups=best_groups,
+                max_steps=max_steps,
+            )
+            if seq is None:
+                continue
+
+            action_sequences.append(seq)
+            kept_indices.append(batch_idx)
+            weights.append(best_gain.detach())
+            gains.append(float(best_gain.detach().item()))
+
+    if not action_sequences:
+        zero = sampled_reward.new_tensor(0.0)
+        return zero, {
+            "applied_ratio": selected_count / float(batch_size),
+            "improved_ratio": 0.0,
+            "reward_gain": 0.0,
+            "kept_count": 0,
+        }
+
+    selected_td = torch.cat([td_static[idx : idx + 1] for idx in kept_indices], dim=0)
+    weight_tensor = torch.stack(weights).to(sampled_actions.device)
+    logp_mut = logprob_of_action_sequences(env, policy, selected_td, action_sequences)
+    loss_mut = -(weight_tensor.detach() * logp_mut).mean()
+
+    return loss_mut, {
+        "applied_ratio": selected_count / float(batch_size),
+        "improved_ratio": len(action_sequences) / float(selected_count),
+        "reward_gain": float(np.mean(gains)) if gains else 0.0,
+        "kept_count": len(action_sequences),
+    }
+
+
 def main():
     train_start_time = time.time()
 
@@ -95,8 +336,11 @@ def main():
     epochs = 1000
     lr = 1e-4
     grad_clip = 1.0
-    entropy_coef = 0.10
+    entropy_coef = 0.05
     temperature = 2.0
+    mutation_frac = 0.10
+    mutation_attempts = 1
+    mutation_loss_weight = 0.30
 
     # =========================
     # TensorBoard
@@ -132,7 +376,7 @@ def main():
     # Environment / Model
     # =========================
     generator_params = dict(
-        num_parts=4,
+        num_parts=20,
         max_num_parts=20,
         material_types=2,
         p_relative_motion=0.10,
@@ -183,7 +427,7 @@ def main():
         policy.temperature = float(temperature)
 
         td0 = env.reset(batch_size).to(device)
-        actions, logps, entropies, terminal_reward, total_reward, _ = rollout_episode_from_td(
+        actions, logps, entropies, terminal_reward, total_reward, _, step_counts = rollout_episode_from_td(
             env=env,
             policy=policy,
             td_init=td0,
@@ -195,7 +439,7 @@ def main():
         # greedy baseline
         policy.eval()
         with torch.no_grad():
-            _, _, _, reward_greedy, _, _ = rollout_episode_from_td(
+            _, _, _, reward_greedy, _, _, step_counts_greedy = rollout_episode_from_td(
                 env=env,
                 policy=policy,
                 td_init=td0,
@@ -213,7 +457,17 @@ def main():
         train_q_observed, train_q_expected_penalty, train_q_gamma = env._terminal_reward_terms(reward_metrics)
 
         loss_pg = -(advantage_norm.detach() * logp_sum).mean()
-        loss = loss_pg - entropy_coef * entropy_mean
+        loss_mutation, mutation_stats = compute_mutation_auxiliary_loss(
+            env=env,
+            policy=policy,
+            td_static=td0,
+            sampled_actions=actions,
+            sampled_reward=terminal_reward.detach(),
+            mutation_frac=mutation_frac,
+            mutation_attempts=mutation_attempts,
+            max_steps=max_steps,
+        )
+        loss = loss_pg + mutation_loss_weight * loss_mutation - entropy_coef * entropy_mean
 
         optimizer.zero_grad()
         loss.backward()
@@ -230,19 +484,23 @@ def main():
                 "optimizer": optimizer.state_dict(),
             }, save_dir / f"pc_model_ep{ep}.pt")
 
-        groups = env.actions_to_groups(actions, N=gen.num_nodes)
-        avg_group_count = float(np.mean([len(g) for g in groups]))
-        avg_group_size = float(
-            np.mean([np.mean([len(x) for x in g]) if len(g) > 0 else 0.0 for g in groups])
-        )
-        avg_terminal_reward = terminal_reward.mean().item()
-
         writer.add_scalar("train/reward_total", total_reward.mean().item(), ep)
+        writer.add_scalar("train/reward_terminal", terminal_reward.mean().item(), ep)
         writer.add_scalar("train/reward_greedy", reward_greedy.mean().item(), ep)
+        writer.add_scalar("train/episode_steps_mean", step_counts.mean().item(), ep)
+        writer.add_scalar("train/episode_steps_greedy_mean", step_counts_greedy.mean().item(), ep)
         writer.add_scalar("train/loss", loss.item(), ep)
+        writer.add_scalar("train/loss_pg", loss_pg.item(), ep)
+        writer.add_scalar("train/loss_mutation", loss_mutation.item(), ep)
         writer.add_scalar("train/entropy", entropy_mean.item(), ep)
         writer.add_scalar("train/entropy_coef", entropy_coef, ep)
         writer.add_scalar("train/temperature", temperature, ep)
+        writer.add_scalar("train/mutation_frac", mutation_frac, ep)
+        writer.add_scalar("train/mutation_loss_weight", mutation_loss_weight, ep)
+        writer.add_scalar("train/mutation_applied_ratio", mutation_stats["applied_ratio"], ep)
+        writer.add_scalar("train/mutation_improved_ratio", mutation_stats["improved_ratio"], ep)
+        writer.add_scalar("train/mutation_reward_gain", mutation_stats["reward_gain"], ep)
+        writer.add_scalar("train/mutation_kept_count", mutation_stats["kept_count"], ep)
         writer.add_scalar("train/advantage_mean", advantage.mean().item(), ep)
         writer.add_scalar("train/advantage_std", advantage.std(unbiased=False).item(), ep)
         writer.add_scalar("train/feasible_ratio", reward_metrics["feasible"].mean().item(), ep)
@@ -259,7 +517,7 @@ def main():
         if ep % 10 == 0:
             policy.eval()
             with torch.no_grad():
-                actions_eval, _, _, reward_eval, _, _ = rollout_episode_from_td(
+                actions_eval, _, _, reward_eval, _, _, step_counts_eval = rollout_episode_from_td(
                     env=env,
                     policy=policy,
                     td_init=td_eval_fixed,
@@ -274,6 +532,7 @@ def main():
 
             writer.add_scalar("eval/reward_total", avg_eval, ep)
             writer.add_scalar("eval/reward_greedy", avg_eval, ep)
+            writer.add_scalar("eval/episode_steps_greedy_mean", step_counts_eval.mean().item(), ep)
             writer.add_scalar("eval/feasible_ratio", eval_metrics["feasible"].mean().item(), ep)
             writer.add_scalar("eval/infeasible_solution", eval_metrics["infeasible_solution"].mean().item(), ep)
             writer.add_scalar("eval/infeasible_groups", eval_metrics["infeasible_groups"].mean().item(), ep)
@@ -307,11 +566,12 @@ def main():
                 f"train_feasible={reward_metrics['feasible'].mean().item():.3f} "
                 f"eval_feasible={eval_metrics['feasible'].mean().item():.3f} "
                 f"loss={loss.item():.4f} "
+                f"loss_mut={loss_mutation.item():.4f} "
+                f"mut_improve={mutation_stats['improved_ratio']:.3f} "
                 f"entropy={entropy_mean.item():.4f} "
                 f"beta={entropy_coef:.4f} "
                 f"temp={temperature:.3f} "
-                f"avg_group_count={avg_group_count:.2f} "
-                f"avg_group_size={avg_group_size:.2f}"
+                f"avg_group_count={reward_metrics['num_groups'].mean().item():.2f}"
             )
 
     writer.close()

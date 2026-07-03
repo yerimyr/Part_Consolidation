@@ -20,9 +20,9 @@ class SASolver:
 
     def __init__(
         self,
-        iterations: int = 3000,
+        iterations: int = 10000,
         initial_temperature: float = 1.0,
-        cooling_rate: float = 0.995,
+        cooling_rate: float = 0.9985,
         min_temperature: float = 1e-4,
         init_new_group_bias: float = 0.60,
         enable_post_merge_repair: bool = False,
@@ -367,7 +367,12 @@ class SASolver:
                 total += float(w[group[i], group[j]])
         return total
 
-    def plot_history(self, save_path: str = "sa_fitness_history.png", show: bool = False) -> str:
+    def plot_history(
+        self,
+        save_path: str = "sa_fitness_history.png",
+        show: bool = False,
+        ylim: tuple[float, float] | None = None,
+    ) -> str:
         if not self.last_best_scores:
             raise RuntimeError("No SA history available. Run solve(...) first.")
 
@@ -382,6 +387,8 @@ class SASolver:
         ax1.plot(steps, self.last_best_scores, label="Best Score", linewidth=2.0)
         ax1.set_xlabel("Iteration")
         ax1.set_ylabel("Score")
+        if ylim is not None:
+            ax1.set_ylim(*ylim)
         ax1.grid(True, alpha=0.3)
         ax1.legend(loc="best")
 

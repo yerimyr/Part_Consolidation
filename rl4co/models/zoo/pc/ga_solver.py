@@ -30,7 +30,7 @@ class GASolver:
         generations: int = 300,
         elite_size: int = 0,
         tournament_size: int = 2,
-        mutation_rate: float = 0.10,
+        mutation_rate: float = 0.00,
         init_new_group_bias: float = 0.60,
         enable_post_merge_repair: bool = False,
         exploratory_crossover_prob: float = 0.25,
@@ -117,7 +117,11 @@ class GASolver:
         cxpb = 0.9
         for generation in range(1, self.generations + 1):
             elites = [toolbox.clone(ind) for ind in tools.selBest(pop, effective_elite_size)]
-            offspring = tools.selTournament(pop, effective_pop_size - effective_elite_size, tournsize=self.tournament_size)
+            offspring = self._select_tournament(
+                pop,
+                effective_pop_size - effective_elite_size,
+                tournsize=self.tournament_size,
+            )
             offspring = [toolbox.clone(ind) for ind in offspring]
             parent_child_best_similarities: list[float] = []
             parent_child_mean_similarities: list[float] = []
@@ -217,6 +221,20 @@ class GASolver:
         for ind, fit in zip(invalid, map(toolbox.evaluate, invalid)):
             ind.fitness.values = fit
 
+    def _select_tournament(self, pop, k: int, tournsize: int):
+        selected = []
+        if not pop or k <= 0:
+            return selected
+
+        tournsize = max(1, int(tournsize))
+        for _ in range(k):
+            if tournsize <= len(pop):
+                aspirants = self.rng.sample(pop, tournsize)
+            else:
+                aspirants = [self.rng.choice(pop) for _ in range(tournsize)]
+            selected.append(max(aspirants, key=lambda ind: ind.fitness.values[0]))
+        return selected
+
     def _evaluate_individual(self, ind, inst):
         return (self._fitness(self._as_array(ind), inst),)
 
@@ -245,7 +263,12 @@ class GASolver:
             return sol.astype(int, copy=True)
         return np.asarray(list(sol), dtype=int)
 
-    def plot_fitness_history(self, save_path: str = "ga_fitness_history.png", show: bool = False) -> str:
+    def plot_fitness_history(
+        self,
+        save_path: str = "ga_fitness_history.png",
+        show: bool = False,
+        ylim: tuple[float, float] | None = None,
+    ) -> str:
         if not self.last_generation_best_scores:
             raise RuntimeError("No GA fitness history available. Run solve(...) first.")
 
@@ -263,6 +286,8 @@ class GASolver:
         ax.set_xlabel("Generation")
         ax.set_ylabel("Raw Fitness")
         ax.set_title("GA Raw Fitness by Generation")
+        if ylim is not None:
+            ax.set_ylim(*ylim)
         ax.grid(True, alpha=0.3)
         ax.legend()
 

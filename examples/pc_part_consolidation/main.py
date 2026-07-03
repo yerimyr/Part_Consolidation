@@ -524,21 +524,22 @@ def make_seeded_fixed_td(env, seed: int):
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
-def run_fixed(env, policy, fixed_seed=42):
+def run_fixed(env, policy, fixed_seed=1):
+    fitness_ylim = (-0.06, 0.115)
     td = make_seeded_fixed_td(env, seed=fixed_seed)
     inst = td_to_inst(td, env.generator.num_parts)
     print_instance(inst, "FIXED INSTANCE USED IN THE EXPERIMENT")
     proxy = compute_search_space_proxy(inst)
 
     cpccd = CPCCDSolver()
-    ga = GASolver()
+    ga = GASolver(seed=fixed_seed)
     sa = SASolver()
 
     g1, t1 = cpccd.solve(inst)
     g2, t2 = ga.solve(inst)
     g_sa, t_sa = sa.solve(inst)
-    ga.plot_fitness_history("ga_fitness_fixed.png")
-    sa.plot_history("sa_fitness_fixed.png")
+    ga.plot_fitness_history("ga_fitness_fixed.png", ylim=fitness_ylim)
+    sa.plot_history("sa_fitness_fixed.png", ylim=fitness_ylim)
     m1 = evaluate_groups(g1, inst)
     m2 = evaluate_groups(g2, inst)
     m_sa = evaluate_groups(g_sa, inst)
@@ -576,9 +577,10 @@ def _clone_env_with_num_parts(env, num_parts: int):
 
 
 def run_generalization(env, policy, num_instances=30, min_parts=4, max_parts=10, seed=123):
+    fitness_ylim = (-1.0, 0.20)
     results = []
     cpccd = CPCCDSolver()
-    ga = GASolver()
+    ga = GASolver(seed=seed)
     sa = SASolver()
     plot_dir = Path("ga_fitness_generalization")
     plot_dir.mkdir(parents=True, exist_ok=True)
@@ -598,8 +600,8 @@ def run_generalization(env, policy, num_instances=30, min_parts=4, max_parts=10,
         g1, t1 = cpccd.solve(inst)
         g2, t2 = ga.solve(inst)
         g_sa, t_sa = sa.solve(inst)
-        ga.plot_fitness_history(str(plot_dir / f"ga_fitness_instance_{i}.png"))
-        sa.plot_history(str(sa_plot_dir / f"sa_fitness_instance_{i}.png"))
+        ga.plot_fitness_history(str(plot_dir / f"ga_fitness_instance_{i}.png"), ylim=fitness_ylim)
+        sa.plot_history(str(sa_plot_dir / f"sa_fitness_instance_{i}.png"), ylim=fitness_ylim)
         m1 = evaluate_groups(g1, inst)
         m1["num_parts"] = inst["num_parts"]
         m2 = evaluate_groups(g2, inst)
@@ -925,7 +927,7 @@ def main():
     device = "cpu"
 
     generator_params = dict(
-        num_parts=4,
+        num_parts=20,
         max_num_parts=20,
         material_types=2,
         p_relative_motion=0.10,
@@ -945,7 +947,7 @@ def main():
 
     gen = FPIGenerator(**generator_params)
     env = PartConsolidationEnv(generator=gen, device=device)
-    fixed_seed = 2
+    fixed_seed = 1
     ckpt = Path("checkpoints") / "best_model.pt"
     policy = load_policy(gen, device, ckpt)
 
@@ -989,3 +991,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+
