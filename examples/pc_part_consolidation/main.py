@@ -524,15 +524,15 @@ def make_seeded_fixed_td(env, seed: int):
             torch.cuda.set_rng_state_all(cuda_rng_states)
 
 
-def run_fixed(env, policy, fixed_seed=1):
+def run_fixed(env, policy, fixed_instance_seed=1, fixed_ga_seed=1):
     fitness_ylim = (-0.06, 0.115)
-    td = make_seeded_fixed_td(env, seed=fixed_seed)
+    td = make_seeded_fixed_td(env, seed=fixed_instance_seed)
     inst = td_to_inst(td, env.generator.num_parts)
     print_instance(inst, "FIXED INSTANCE USED IN THE EXPERIMENT")
     proxy = compute_search_space_proxy(inst)
 
     cpccd = CPCCDSolver()
-    ga = GASolver(seed=fixed_seed)
+    ga = GASolver(seed=fixed_ga_seed)
     sa = SASolver()
 
     g1, t1 = cpccd.solve(inst)
@@ -947,12 +947,18 @@ def main():
 
     gen = FPIGenerator(**generator_params)
     env = PartConsolidationEnv(generator=gen, device=device)
-    fixed_seed = 1
+    fixed_instance_seed = 1
+    fixed_ga_seed = 5
     ckpt = Path("checkpoints") / "best_model.pt"
     policy = load_policy(gen, device, ckpt)
 
     print("\n===== FIXED INSTANCE EXPERIMENT =====")
-    fixed_inst, fixed_results = run_fixed(env, policy, fixed_seed=fixed_seed)
+    fixed_inst, fixed_results = run_fixed(
+        env,
+        policy,
+        fixed_instance_seed=fixed_instance_seed,
+        fixed_ga_seed=fixed_ga_seed,
+    )
     df_fixed, summary_fixed = save_results(fixed_results, "fixed_results.csv")
     for row in summary_fixed:
         print(row)
@@ -991,6 +997,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 

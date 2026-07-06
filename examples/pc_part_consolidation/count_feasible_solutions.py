@@ -17,12 +17,12 @@ from rl4co.envs.pc.generator import FPIGenerator
 
 
 DEFAULT_GENERATOR_PARAMS = dict(
-    num_parts=4,
-    max_num_parts=4,
+    num_parts=20,
+    max_num_parts=20,
     topology_mode="dense_clustered",
     material_types=2,
-    p_relative_motion=0.03,
-    p_extra_edge=0.80,
+    p_relative_motion=0.10,
+    p_extra_edge=0.50,
     L_low=20.0,
     L_high=120.0,
     W_low=10.0,
@@ -32,8 +32,8 @@ DEFAULT_GENERATOR_PARAMS = dict(
     build_limit_L=1000.0,
     build_limit_W=1000.0,
     build_limit_H=500.0,
-    p_maint_H=0.02,
-    p_standard=0.01,
+    p_maint_H=0.10,
+    p_standard=0.10,
 )
 
 

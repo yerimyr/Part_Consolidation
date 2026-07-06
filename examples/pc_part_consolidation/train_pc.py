@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import random
 import sys
@@ -22,6 +23,14 @@ if str(PROJECT_ROOT) not in sys.path:
 from rl4co.envs.pc.env import PartConsolidationEnv
 from rl4co.envs.pc.generator import FPIGenerator
 from rl4co.models.zoo.pc.policy import PCPolicy
+
+
+def tensor_device_name(x) -> str:
+    return str(x.device) if torch.is_tensor(x) else "unknown"
+
+
+def first_parameter_device(module: torch.nn.Module) -> str:
+    return str(next(module.parameters()).device)
 
 
 def rollout_episode_from_td(
@@ -333,7 +342,7 @@ def main():
     batch_size = 256
     eval_batch_size = 128
     eval_seed = 4321
-    epochs = 1000
+    epochs = 300
     lr = 1e-4
     grad_clip = 1.0
     entropy_coef = 0.05
@@ -348,20 +357,35 @@ def main():
     log_dir = f"runs/pc_general_graph_groupcount_{int(time.time())}"
     writer = SummaryWriter(log_dir=log_dir)
     print("TensorBoard log dir:", log_dir)
-    writer.add_custom_scalars(
-        {
-            "Reward Components": {
-                "Train weighted objective terms": [
-                    "Multiline",
-                    ["train/Q_observed", "train/Q_expected_penalty", "train/Q_gamma"],
-                ],
-                "Eval weighted objective terms": [
-                    "Multiline",
-                    ["eval/Q_observed", "eval/Q_expected_penalty", "eval/Q_gamma"],
-                ],
-            }
-        }
-    )
+    timing_csv_path = Path(log_dir) / "timing_by_epoch.csv"
+    timing_csv_path.parent.mkdir(parents=True, exist_ok=True)
+    with timing_csv_path.open("w", newline="", encoding="utf-8") as f:
+        writer_csv = csv.writer(f)
+        writer_csv.writerow(
+            [
+                "epoch",
+                "batch_index",
+                "batch_size",
+                "problem_generation_and_transfer_sec",
+                "sampling_and_greedy_sec",
+                "learning_sec",
+                "epoch_sec",
+                "cumulative_problem_generation_and_transfer_sec",
+                "cumulative_sampling_and_greedy_sec",
+                "cumulative_learning_sec",
+                "cumulative_epoch_sec",
+                "cumulative_stage_sum_sec",
+                "wall_clock_elapsed_sec",
+                "unaccounted_wall_clock_sec",
+                "generation_device",
+                "problem_input_device",
+                "policy_device",
+                "sampling_action_device",
+                "sampling_logp_device",
+                "loss_device",
+            ]
+        )
+    print("Timing CSV:", timing_csv_path)
 
     # =========================
     # 🔥 [추가] 모델 저장 설정
@@ -422,11 +446,24 @@ def main():
     # =========================
     # Training Loop
     # =========================
+    cumulative_generation_time_sec = 0.0
+    cumulative_sampling_time_sec = 0.0
+    cumulative_learning_time_sec = 0.0
+    cumulative_epoch_time_sec = 0.0
     for ep in range(1, epochs + 1):
+        epoch_time_start = time.perf_counter()
         policy.train()
         policy.temperature = float(temperature)
 
-        td0 = env.reset(batch_size).to(device)
+        generation_time_start = time.perf_counter()
+        td_generated = env.reset(batch_size)
+        generation_device = tensor_device_name(td_generated["material"])
+        td0 = td_generated.to(device)
+        problem_input_device = tensor_device_name(td0["material"])
+        policy_device = first_parameter_device(policy)
+        generation_time_sec = time.perf_counter() - generation_time_start
+
+        sampling_time_start = time.perf_counter()
         actions, logps, entropies, terminal_reward, total_reward, _, step_counts = rollout_episode_from_td(
             env=env,
             policy=policy,
@@ -435,11 +472,13 @@ def main():
             sample=True,
             epsilon=0.0,
         )
+        sampling_action_device = tensor_device_name(actions)
+        sampling_logp_device = tensor_device_name(logps)
 
         # greedy baseline
         policy.eval()
         with torch.no_grad():
-            _, _, _, reward_greedy, _, _, step_counts_greedy = rollout_episode_from_td(
+            _, _, _, reward_greedy, _, _, _ = rollout_episode_from_td(
                 env=env,
                 policy=policy,
                 td_init=td0,
@@ -448,13 +487,14 @@ def main():
                 epsilon=0.0,
         )
         policy.train()
+        sampling_time_sec = time.perf_counter() - sampling_time_start
 
+        learning_time_start = time.perf_counter()
         advantage = total_reward - reward_greedy
         advantage_norm = (advantage - advantage.mean()) / advantage.std(unbiased=False).clamp_min(1e-8)
         logp_sum = logps.sum(dim=1)
         entropy_mean = entropies.mean()
         reward_metrics = env.reward_metrics_from_actions(actions)
-        train_q_observed, train_q_expected_penalty, train_q_gamma = env._terminal_reward_terms(reward_metrics)
 
         loss_pg = -(advantage_norm.detach() * logp_sum).mean()
         loss_mutation, mutation_stats = compute_mutation_auxiliary_loss(
@@ -468,11 +508,67 @@ def main():
             max_steps=max_steps,
         )
         loss = loss_pg + mutation_loss_weight * loss_mutation - entropy_coef * entropy_mean
+        loss_device = tensor_device_name(loss)
+
+        if ep == 1:
+            device_report = (
+                "Stage 1 - problem instance generation\n"
+                f"- env.reset output device: {generation_device}\n"
+                f"- model input TensorDict after .to(device): {problem_input_device}\n\n"
+                "Stage 2 - policy sampling\n"
+                f"- policy parameter device: {policy_device}\n"
+                f"- sampled action tensor device: {sampling_action_device}\n"
+                f"- sampled log probability tensor device: {sampling_logp_device}\n\n"
+                "Stage 3 - learning / loss update\n"
+                f"- terminal reward device: {tensor_device_name(terminal_reward)}\n"
+                f"- loss tensor device: {loss_device}\n"
+            )
+            print("\n===== DEVICE STAGE REPORT =====")
+            print(device_report)
 
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
         optimizer.step()
+        learning_time_sec = time.perf_counter() - learning_time_start
+        epoch_time_sec = time.perf_counter() - epoch_time_start
+        cumulative_generation_time_sec += generation_time_sec
+        cumulative_sampling_time_sec += sampling_time_sec
+        cumulative_learning_time_sec += learning_time_sec
+        cumulative_epoch_time_sec += epoch_time_sec
+        cumulative_stage_sum_sec = (
+            cumulative_generation_time_sec
+            + cumulative_sampling_time_sec
+            + cumulative_learning_time_sec
+        )
+        wall_clock_elapsed_sec = time.time() - train_start_time
+        unaccounted_wall_clock_sec = wall_clock_elapsed_sec - cumulative_stage_sum_sec
+        with timing_csv_path.open("a", newline="", encoding="utf-8") as f:
+            writer_csv = csv.writer(f)
+            writer_csv.writerow(
+                [
+                    ep,
+                    0,
+                    batch_size,
+                    f"{generation_time_sec:.6f}",
+                    f"{sampling_time_sec:.6f}",
+                    f"{learning_time_sec:.6f}",
+                    f"{epoch_time_sec:.6f}",
+                    f"{cumulative_generation_time_sec:.6f}",
+                    f"{cumulative_sampling_time_sec:.6f}",
+                    f"{cumulative_learning_time_sec:.6f}",
+                    f"{cumulative_epoch_time_sec:.6f}",
+                    f"{cumulative_stage_sum_sec:.6f}",
+                    f"{wall_clock_elapsed_sec:.6f}",
+                    f"{unaccounted_wall_clock_sec:.6f}",
+                    generation_device,
+                    problem_input_device,
+                    policy_device,
+                    sampling_action_device,
+                    sampling_logp_device,
+                    loss_device,
+                ]
+            )
 
         # =========================
         # 🔥 [추가] checkpoint 저장
@@ -485,39 +581,23 @@ def main():
             }, save_dir / f"pc_model_ep{ep}.pt")
 
         writer.add_scalar("train/reward_total", total_reward.mean().item(), ep)
-        writer.add_scalar("train/reward_terminal", terminal_reward.mean().item(), ep)
         writer.add_scalar("train/reward_greedy", reward_greedy.mean().item(), ep)
         writer.add_scalar("train/episode_steps_mean", step_counts.mean().item(), ep)
-        writer.add_scalar("train/episode_steps_greedy_mean", step_counts_greedy.mean().item(), ep)
         writer.add_scalar("train/loss", loss.item(), ep)
         writer.add_scalar("train/loss_pg", loss_pg.item(), ep)
         writer.add_scalar("train/loss_mutation", loss_mutation.item(), ep)
         writer.add_scalar("train/entropy", entropy_mean.item(), ep)
-        writer.add_scalar("train/entropy_coef", entropy_coef, ep)
-        writer.add_scalar("train/temperature", temperature, ep)
-        writer.add_scalar("train/mutation_frac", mutation_frac, ep)
-        writer.add_scalar("train/mutation_loss_weight", mutation_loss_weight, ep)
-        writer.add_scalar("train/mutation_applied_ratio", mutation_stats["applied_ratio"], ep)
         writer.add_scalar("train/mutation_improved_ratio", mutation_stats["improved_ratio"], ep)
         writer.add_scalar("train/mutation_reward_gain", mutation_stats["reward_gain"], ep)
         writer.add_scalar("train/mutation_kept_count", mutation_stats["kept_count"], ep)
         writer.add_scalar("train/advantage_mean", advantage.mean().item(), ep)
         writer.add_scalar("train/advantage_std", advantage.std(unbiased=False).item(), ep)
-        writer.add_scalar("train/feasible_ratio", reward_metrics["feasible"].mean().item(), ep)
-        writer.add_scalar("train/infeasible_solution", reward_metrics["infeasible_solution"].mean().item(), ep)
-        writer.add_scalar("train/infeasible_groups", reward_metrics["infeasible_groups"].mean().item(), ep)
         writer.add_scalar("train/num_groups", reward_metrics["num_groups"].mean().item(), ep)
-        writer.add_scalar("train/internal_strength", reward_metrics["total_internal_strength"].mean().item(), ep)
-        writer.add_scalar("train/normalized_internal_strength", reward_metrics["normalized_internal_strength"].mean().item(), ep)
-        writer.add_scalar("train/feasible_pair_count", reward_metrics["feasible_pair_count"].mean().item(), ep)
-        writer.add_scalar("train/Q_observed", train_q_observed.mean().item(), ep)
-        writer.add_scalar("train/Q_expected_penalty", train_q_expected_penalty.mean().item(), ep)
-        writer.add_scalar("train/Q_gamma", train_q_gamma.mean().item(), ep)
 
         if ep % 10 == 0:
             policy.eval()
             with torch.no_grad():
-                actions_eval, _, _, reward_eval, _, _, step_counts_eval = rollout_episode_from_td(
+                actions_eval, _, _, reward_eval, _, _, _ = rollout_episode_from_td(
                     env=env,
                     policy=policy,
                     td_init=td_eval_fixed,
@@ -526,23 +606,12 @@ def main():
                     epsilon=0.0,
                 )
                 eval_metrics = env.reward_metrics_from_actions(actions_eval)
-                eval_q_observed, eval_q_expected_penalty, eval_q_gamma = env._terminal_reward_terms(eval_metrics)
 
             avg_eval = reward_eval.mean().item()
 
             writer.add_scalar("eval/reward_total", avg_eval, ep)
             writer.add_scalar("eval/reward_greedy", avg_eval, ep)
-            writer.add_scalar("eval/episode_steps_greedy_mean", step_counts_eval.mean().item(), ep)
-            writer.add_scalar("eval/feasible_ratio", eval_metrics["feasible"].mean().item(), ep)
-            writer.add_scalar("eval/infeasible_solution", eval_metrics["infeasible_solution"].mean().item(), ep)
-            writer.add_scalar("eval/infeasible_groups", eval_metrics["infeasible_groups"].mean().item(), ep)
             writer.add_scalar("eval/num_groups", eval_metrics["num_groups"].mean().item(), ep)
-            writer.add_scalar("eval/internal_strength", eval_metrics["total_internal_strength"].mean().item(), ep)
-            writer.add_scalar("eval/normalized_internal_strength", eval_metrics["normalized_internal_strength"].mean().item(), ep)
-            writer.add_scalar("eval/feasible_pair_count", eval_metrics["feasible_pair_count"].mean().item(), ep)
-            writer.add_scalar("eval/Q_observed", eval_q_observed.mean().item(), ep)
-            writer.add_scalar("eval/Q_expected_penalty", eval_q_expected_penalty.mean().item(), ep)
-            writer.add_scalar("eval/Q_gamma", eval_q_gamma.mean().item(), ep)
 
             # =========================
             # 🔥 [추가] BEST MODEL 저장
@@ -571,7 +640,14 @@ def main():
                 f"entropy={entropy_mean.item():.4f} "
                 f"beta={entropy_coef:.4f} "
                 f"temp={temperature:.3f} "
-                f"avg_group_count={reward_metrics['num_groups'].mean().item():.2f}"
+                f"avg_group_count={reward_metrics['num_groups'].mean().item():.2f} "
+                f"time_gen={generation_time_sec:.3f}s "
+                f"time_sampling={sampling_time_sec:.3f}s "
+                f"time_learning={learning_time_sec:.3f}s "
+                f"time_epoch={epoch_time_sec:.3f}s "
+                f"cum_stage={cumulative_stage_sum_sec:.1f}s "
+                f"wall={wall_clock_elapsed_sec:.1f}s "
+                f"unaccounted={unaccounted_wall_clock_sec:.1f}s"
             )
 
     writer.close()
