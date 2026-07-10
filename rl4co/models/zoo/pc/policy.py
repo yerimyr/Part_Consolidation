@@ -67,18 +67,29 @@ class PCPolicy(nn.Module):
             nn.Linear(emb_dim, 1),
         )
         self.logit_bias = nn.Parameter(torch.zeros(1))
+        self._pair_cache: dict[tuple[int, torch.device], tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _pair_tensors(self, max_parts: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        key = (max_parts, device)
+        if key not in self._pair_cache:
+            pairs = [(i, j) for i in range(max_parts) for j in range(i + 1, max_parts)]
+            self._pair_cache[key] = (
+                torch.tensor([p[0] for p in pairs], dtype=torch.long, device=device),
+                torch.tensor([p[1] for p in pairs], dtype=torch.long, device=device),
+            )
+        return self._pair_cache[key]
 
     def build_dynamic_node_features(self, td: TensorDict) -> torch.Tensor:
         B, N, _ = td["node_features"].shape
 
         group_id = td["group_id"]
         valid_part = td.get("valid_part_mask", group_id.ge(0)).float().unsqueeze(-1)
-        group_card = torch.zeros((B, N), dtype=torch.float32, device=group_id.device)
-        for b in range(B):
-            ids = torch.unique(group_id[b][group_id[b] >= 0])
-            for gid in ids.tolist():
-                members = group_id[b].eq(int(gid))
-                group_card[b, members] = members.float().sum()
+        max_parts = N - 1
+        valid_group = group_id.ge(0)
+        group_idx = group_id.clamp(min=0, max=max_parts - 1)
+        group_counts = torch.zeros((B, max_parts), dtype=torch.float32, device=group_id.device)
+        group_counts.scatter_add_(1, group_idx, valid_group.float())
+        group_card = group_counts.gather(1, group_idx) * valid_group.float()
         group_card_ratio = (group_card / max(float(N - 1), 1.0)).unsqueeze(-1)
 
         dyn = torch.cat([valid_part, group_card_ratio], dim=-1)
@@ -103,7 +114,6 @@ class PCPolicy(nn.Module):
         action_mask = td["action_mask"]
         num_actions = action_mask.size(-1)
         max_parts = N - 1
-        pair_list = [(i, j) for i in range(max_parts) for j in range(i + 1, max_parts)]
 
         valid = td.get("valid_part_mask", group_id.ge(0))
         part_mask = valid[:, 1:].float()
@@ -113,23 +123,22 @@ class PCPolicy(nn.Module):
         logits = torch.full((B, num_actions), -1e9, dtype=node_emb.dtype, device=node_emb.device)
         logits[:, 0] = self.stop_scorer(global_context).squeeze(-1)
 
-        for b in range(B):
-            group_emb: dict[int, torch.Tensor] = {}
-            ids = sorted({int(g) for g in group_id[b, 1:][valid[b, 1:]].tolist() if int(g) >= 0})
-            for gid in ids:
-                members = (group_id[b] == gid) & valid[b]
-                denom = members.float().sum().clamp_min(1.0)
-                group_emb[gid] = (node_emb[b] * members.float().unsqueeze(-1)).sum(dim=0) / denom
+        if num_actions > 1:
+            valid_group = group_id.ge(0) & valid.bool()
+            group_idx = group_id.clamp(min=0, max=max_parts - 1)
+            membership = F.one_hot(group_idx, num_classes=max_parts).to(node_emb.dtype)
+            membership = membership * valid_group.unsqueeze(-1).to(node_emb.dtype)
+            group_counts = membership.sum(dim=1).clamp_min(1.0)
+            group_emb = torch.einsum("bng,bne->bge", membership, node_emb) / group_counts.unsqueeze(-1)
 
-            for action_idx, (ga, gb) in enumerate(pair_list, start=1):
-                if action_idx >= num_actions:
-                    break
-                if ga not in group_emb or gb not in group_emb:
-                    continue
-                ha = group_emb[ga]
-                hb = group_emb[gb]
-                feat = torch.cat([ha, hb, torch.abs(ha - hb), ha * hb], dim=-1)
-                logits[b, action_idx] = self.pair_scorer(feat).squeeze(-1)
+            pair_ga, pair_gb = self._pair_tensors(max_parts, node_emb.device)
+            num_pair_actions = min(num_actions - 1, pair_ga.numel())
+            pair_ga = pair_ga[:num_pair_actions]
+            pair_gb = pair_gb[:num_pair_actions]
+            ha = group_emb.index_select(1, pair_ga)
+            hb = group_emb.index_select(1, pair_gb)
+            feat = torch.cat([ha, hb, torch.abs(ha - hb), ha * hb], dim=-1)
+            logits[:, 1 : 1 + num_pair_actions] = self.pair_scorer(feat).squeeze(-1)
 
         logits = logits + self.logit_bias
         return logits

@@ -7,6 +7,7 @@ import numpy as np
 
 SCORE_EPS = 1e-8
 DEFAULT_MODULARITY_GAMMA = 1.0
+DEFAULT_OBJECTIVE_SCALE = 1000.0
 
 
 def group_size_ok(group: list[int], inst) -> bool:
@@ -134,9 +135,9 @@ def evaluate_groups(groups: list[list[int]], inst) -> dict[str, float]:
         "total_internal_strength": float(total_internal_strength),
         "feasible_pair_count": float(total_feasible_pairs),
         "normalized_internal_strength": float(normalized_internal_strength),
-        "Q_gamma": float(q_gamma),
-        "Q_observed": float(q_observed),
-        "Q_expected": float(q_expected),
+        "Q_gamma": float(q_gamma * DEFAULT_OBJECTIVE_SCALE),
+        "Q_observed": float(q_observed * DEFAULT_OBJECTIVE_SCALE),
+        "Q_expected": float(q_expected * DEFAULT_OBJECTIVE_SCALE),
     }
 
 

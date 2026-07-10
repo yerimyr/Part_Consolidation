@@ -150,7 +150,7 @@ def reward_for_single_grouping(env: PartConsolidationEnv, td_static, batch_idx: 
     old_static_td = env._reward_static_td
     try:
         env._reward_static_td = td_static[batch_idx : batch_idx + 1].clone()
-        metrics = env._terminal_reward_components([groups], device=td_static.device)
+        metrics = env._terminal_reward_components([groups], device=td_static["W"].device)
         return metrics["Q_gamma"][0]
     finally:
         env._reward_static_td = old_static_td
@@ -187,7 +187,7 @@ def grouping_to_action_sequence(
                 if not bool(td["action_mask"][0, action].item()):
                     continue
 
-                action_tensor = torch.tensor([action], dtype=torch.long, device=td.device)
+                action_tensor = torch.tensor([action], dtype=torch.long, device=td["group_id"].device)
                 actions.append(action)
                 td = env.step(td, action_tensor)
                 pending.remove(node)
@@ -211,17 +211,18 @@ def logprob_of_action_sequences(
     td_init,
     action_sequences: list[list[int]],
 ) -> torch.Tensor:
+    device = td_init["group_id"].device
     if not action_sequences:
-        return torch.empty((0,), dtype=torch.float32, device=td_init.device)
+        return torch.empty((0,), dtype=torch.float32, device=device)
 
-    lengths = torch.tensor([len(seq) for seq in action_sequences], dtype=torch.long, device=td_init.device)
+    lengths = torch.tensor([len(seq) for seq in action_sequences], dtype=torch.long, device=device)
     max_len = int(lengths.max().item())
-    action_tensor = torch.zeros((len(action_sequences), max_len), dtype=torch.long, device=td_init.device)
+    action_tensor = torch.zeros((len(action_sequences), max_len), dtype=torch.long, device=device)
     for idx, seq in enumerate(action_sequences):
-        action_tensor[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=td_init.device)
+        action_tensor[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
 
     td = td_init.clone()
-    logp_sum = torch.zeros((len(action_sequences),), dtype=torch.float32, device=td_init.device)
+    logp_sum = torch.zeros((len(action_sequences),), dtype=torch.float32, device=device)
 
     for t in range(max_len):
         active = t < lengths
@@ -253,6 +254,9 @@ def compute_mutation_auxiliary_loss(
     sampled_reward: torch.Tensor,
     mutation_frac: float,
     mutation_attempts: int,
+    mutation_accept_worse: bool,
+    mutation_worse_accept_prob: float,
+    mutation_worse_weight: float,
     max_steps: int,
 ):
     batch_size = sampled_actions.size(0)
@@ -264,6 +268,8 @@ def compute_mutation_auxiliary_loss(
             "improved_ratio": 0.0,
             "reward_gain": 0.0,
             "kept_count": 0,
+            "worse_kept_count": 0,
+            "worse_accept_ratio": 0.0,
         }
 
     selected_count = min(batch_size, selected_count)
@@ -274,12 +280,14 @@ def compute_mutation_auxiliary_loss(
     action_sequences = []
     weights = []
     gains = []
+    improved_count = 0
+    worse_kept_count = 0
 
     with torch.no_grad():
         for batch_idx in selected:
             base_groups = sampled_groups[batch_idx]
             best_groups = None
-            best_gain = sampled_reward.new_tensor(0.0)
+            best_gain = None
 
             for _ in range(mutation_attempts):
                 mutated = mutate_grouping_once(env, td_static, batch_idx, base_groups)
@@ -287,12 +295,24 @@ def compute_mutation_auxiliary_loss(
                     continue
                 reward_mut = reward_for_single_grouping(env, td_static, batch_idx, mutated)
                 gain = reward_mut - sampled_reward[batch_idx]
-                if gain > best_gain:
+                if best_gain is None or gain > best_gain:
                     best_gain = gain
                     best_groups = mutated
 
-            if best_groups is None or best_gain <= 0:
+            if best_groups is None or best_gain is None:
                 continue
+
+            improved = bool((best_gain > 0).item())
+            if improved:
+                sequence_weight = best_gain.detach()
+                improved_count += 1
+            else:
+                if not mutation_accept_worse:
+                    continue
+                if torch.rand((), device=sampled_actions.device).item() > mutation_worse_accept_prob:
+                    continue
+                sequence_weight = sampled_reward.new_tensor(float(mutation_worse_weight))
+                worse_kept_count += 1
 
             seq = grouping_to_action_sequence(
                 env=env,
@@ -305,7 +325,7 @@ def compute_mutation_auxiliary_loss(
 
             action_sequences.append(seq)
             kept_indices.append(batch_idx)
-            weights.append(best_gain.detach())
+            weights.append(sequence_weight)
             gains.append(float(best_gain.detach().item()))
 
     if not action_sequences:
@@ -315,6 +335,8 @@ def compute_mutation_auxiliary_loss(
             "improved_ratio": 0.0,
             "reward_gain": 0.0,
             "kept_count": 0,
+            "worse_kept_count": 0,
+            "worse_accept_ratio": 0.0,
         }
 
     selected_td = torch.cat([td_static[idx : idx + 1] for idx in kept_indices], dim=0)
@@ -324,9 +346,11 @@ def compute_mutation_auxiliary_loss(
 
     return loss_mut, {
         "applied_ratio": selected_count / float(batch_size),
-        "improved_ratio": len(action_sequences) / float(selected_count),
+        "improved_ratio": improved_count / float(selected_count),
         "reward_gain": float(np.mean(gains)) if gains else 0.0,
         "kept_count": len(action_sequences),
+        "worse_kept_count": worse_kept_count,
+        "worse_accept_ratio": worse_kept_count / float(selected_count),
     }
 
 
@@ -342,7 +366,7 @@ def main():
     batch_size = 256
     eval_batch_size = 128
     eval_seed = 4321
-    epochs = 300
+    epochs = 500
     lr = 1e-4
     grad_clip = 1.0
     entropy_coef = 0.05
@@ -350,6 +374,9 @@ def main():
     mutation_frac = 0.10
     mutation_attempts = 1
     mutation_loss_weight = 0.30
+    mutation_accept_worse = True
+    mutation_worse_accept_prob = 0.20
+    mutation_worse_weight = 0.02
 
     # =========================
     # TensorBoard
@@ -505,6 +532,9 @@ def main():
             sampled_reward=terminal_reward.detach(),
             mutation_frac=mutation_frac,
             mutation_attempts=mutation_attempts,
+            mutation_accept_worse=mutation_accept_worse,
+            mutation_worse_accept_prob=mutation_worse_accept_prob,
+            mutation_worse_weight=mutation_worse_weight,
             max_steps=max_steps,
         )
         loss = loss_pg + mutation_loss_weight * loss_mutation - entropy_coef * entropy_mean
@@ -590,6 +620,8 @@ def main():
         writer.add_scalar("train/mutation_improved_ratio", mutation_stats["improved_ratio"], ep)
         writer.add_scalar("train/mutation_reward_gain", mutation_stats["reward_gain"], ep)
         writer.add_scalar("train/mutation_kept_count", mutation_stats["kept_count"], ep)
+        writer.add_scalar("train/mutation_worse_kept_count", mutation_stats["worse_kept_count"], ep)
+        writer.add_scalar("train/mutation_worse_accept_ratio", mutation_stats["worse_accept_ratio"], ep)
         writer.add_scalar("train/advantage_mean", advantage.mean().item(), ep)
         writer.add_scalar("train/advantage_std", advantage.std(unbiased=False).item(), ep)
         writer.add_scalar("train/num_groups", reward_metrics["num_groups"].mean().item(), ep)
@@ -637,6 +669,7 @@ def main():
                 f"loss={loss.item():.4f} "
                 f"loss_mut={loss_mutation.item():.4f} "
                 f"mut_improve={mutation_stats['improved_ratio']:.3f} "
+                f"mut_worse={mutation_stats['worse_accept_ratio']:.3f} "
                 f"entropy={entropy_mean.item():.4f} "
                 f"beta={entropy_coef:.4f} "
                 f"temp={temperature:.3f} "

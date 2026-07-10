@@ -4,6 +4,7 @@ import torch
 from tensordict import TensorDict
 
 from rl4co.envs.pc.evaluator import DEFAULT_MODULARITY_GAMMA
+from rl4co.envs.pc.evaluator import DEFAULT_OBJECTIVE_SCALE
 from rl4co.envs.pc.generator import FPIGenerator
 
 
@@ -38,10 +39,16 @@ class PartConsolidationEnv:
             (i, j) for i in range(self.max_parts) for j in range(i + 1, self.max_parts)
         ]
         self.num_actions = 1 + len(self.group_pair_list)
+        self._pair_ga_cpu = torch.tensor([p[0] for p in self.group_pair_list], dtype=torch.long)
+        self._pair_gb_cpu = torch.tensor([p[1] for p in self.group_pair_list], dtype=torch.long)
         self.F = self.generator.node_feat_dim
         self._reward_static_td: TensorDict | None = None
         self._reward_eps = 1e-8
         self._modularity_gamma = DEFAULT_MODULARITY_GAMMA
+        self._objective_scale = DEFAULT_OBJECTIVE_SCALE
+
+    def _pair_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+        return self._pair_ga_cpu.to(device), self._pair_gb_cpu.to(device)
 
     def reset(self, batch_size: int) -> TensorDict:
         td = self.generator(batch_size=batch_size, device=self.device)
@@ -85,40 +92,38 @@ class PartConsolidationEnv:
         mask = torch.zeros((B, self.num_actions), dtype=torch.bool, device=group_id.device)
         mask[:, 0] = True
 
-        for b in range(B):
-            if bool(td["done"][b].item()):
-                mask[b] = False
-                mask[b, 0] = True
-                continue
+        if self.group_pair_list:
+            pair_ga, pair_gb = self._pair_tensors(group_id.device)
+            valid = valid_part_mask.bool()
+            group_id_exp = group_id[:, None, :]
+            valid_exp = valid[:, None, :]
 
-            active_groups = sorted(
-                {
-                    int(g)
-                    for g in group_id[b, 1:][valid_part_mask[b, 1:]].tolist()
-                    if int(g) >= 0
-                }
-            )
-            group_nodes = {
-                gid: torch.where((group_id[b] == gid) & valid_part_mask[b])[0].tolist()
-                for gid in active_groups
-            }
-            group_nodes = {gid: [node for node in nodes if node > 0] for gid, nodes in group_nodes.items()}
+            group_a_nodes = group_id_exp.eq(pair_ga[None, :, None]) & valid_exp
+            group_b_nodes = group_id_exp.eq(pair_gb[None, :, None]) & valid_exp
+            active_pair = group_a_nodes.any(dim=-1) & group_b_nodes.any(dim=-1)
+            candidate_nodes = group_a_nodes | group_b_nodes
 
-            for action_idx, (ga, gb) in enumerate(self.group_pair_list, start=1):
-                if ga not in group_nodes or gb not in group_nodes:
-                    continue
-                candidate = sorted(group_nodes[ga] + group_nodes[gb])
-                if self._group_feasible(
-                    candidate,
-                    size[b],
-                    build_limit[b],
-                    isstandard[b],
-                    mat_var[b],
-                    maint_diff[b],
-                    rel_motion[b],
-                    assembly_adj[b],
-                ):
-                    mask[b, action_idx] = True
+            candidate_size = torch.einsum("bkn,bnd->bkd", candidate_nodes.float(), size.float())
+            size_ok = candidate_size.le(build_limit[:, None, :].float()).all(dim=-1)
+
+            standard_ok = ~(candidate_nodes & isstandard[:, None, :].bool()).any(dim=-1)
+
+            bad_pair = mat_var.bool() | maint_diff.bool() | rel_motion.bool()
+            candidate_pair = candidate_nodes[:, :, :, None] & candidate_nodes[:, :, None, :]
+            no_bad_pair = ~(candidate_pair & bad_pair[:, None, :, :]).any(dim=(-1, -2))
+
+            cross_connected = (
+                group_a_nodes[:, :, :, None]
+                & group_b_nodes[:, :, None, :]
+                & assembly_adj[:, None, :, :].bool()
+            ).any(dim=(-1, -2))
+
+            mask[:, 1:] = active_pair & size_ok & standard_ok & no_bad_pair & cross_connected
+
+        done = td["done"].view(B).bool()
+        if done.any():
+            mask[done] = False
+            mask[done, 0] = True
 
         return mask
 
@@ -130,16 +135,18 @@ class PartConsolidationEnv:
         done = td["done"].clone()
 
         td2 = td.clone()
-        for b in range(B):
-            if bool(done[b].item()):
-                continue
-            a = int(action[b].item())
-            if a == 0:
-                done[b, 0] = True
-                continue
-            if 1 <= a <= len(self.group_pair_list):
-                ga, gb = self.group_pair_list[a - 1]
-                group_id[b, group_id[b] == gb] = ga
+        active = ~done.view(B).bool()
+        stop_action = active & action.eq(0)
+        done = done | stop_action.view(B, 1)
+
+        if self.group_pair_list:
+            pair_ga, pair_gb = self._pair_tensors(group_id.device)
+            merge_action = active & action.ge(1) & action.le(len(self.group_pair_list))
+            pair_idx = (action - 1).clamp(min=0, max=len(self.group_pair_list) - 1)
+            selected_ga = pair_ga.index_select(0, pair_idx)
+            selected_gb = pair_gb.index_select(0, pair_idx)
+            replace = merge_action[:, None] & group_id.eq(selected_gb[:, None])
+            group_id = torch.where(replace, selected_ga[:, None].expand_as(group_id), group_id)
 
         td2["group_id"] = group_id
 
@@ -288,7 +295,8 @@ class PartConsolidationEnv:
             q_expected[b] = self._modularity_gamma * expected / two_m
             q_gamma[b] = q_observed[b] - q_expected[b]
 
-        return q_gamma, q_observed, q_expected
+        scale = float(self._objective_scale)
+        return q_gamma * scale, q_observed * scale, q_expected * scale
 
     def _group_internal_strength(self, group: list[int], w: torch.Tensor) -> torch.Tensor:
         total = torch.tensor(0.0, device=w.device)

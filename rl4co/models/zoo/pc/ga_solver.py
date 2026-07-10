@@ -27,10 +27,12 @@ class GASolver:
     def __init__(
         self,
         pop_size: int = 120,
-        generations: int = 300,
+        generations: int = 18000,
         elite_size: int = 0,
         tournament_size: int = 2,
-        mutation_rate: float = 0.10,
+        mutation_rate: float = 0.30,
+        strong_mutation_prob: float = 0.50,
+        strong_mutation_steps: int = 5,
         init_new_group_bias: float = 0.60,
         enable_post_merge_repair: bool = False,
         exploratory_crossover_prob: float = 0.25,
@@ -43,6 +45,8 @@ class GASolver:
         self.elite_size = int(elite_size)
         self.tournament_size = int(tournament_size)
         self.mutation_rate = float(mutation_rate)
+        self.strong_mutation_prob = float(strong_mutation_prob)
+        self.strong_mutation_steps = max(1, int(strong_mutation_steps))
         self.init_new_group_bias = float(init_new_group_bias)
         self.enable_post_merge_repair = bool(enable_post_merge_repair)
         self.exploratory_crossover_prob = float(exploratory_crossover_prob)
@@ -56,10 +60,13 @@ class GASolver:
         self.last_generation_mean_raw_scores: list[float] = []
         self.last_generation_unique_raw_score_counts: list[int] = []
         self.last_generation_unique_grouping_counts: list[int] = []
+        self.last_generation_duplicate_grouping_ratios: list[float] = []
         self.last_generation_best_grouping_changed: list[int] = []
         self.last_generation_parent_child_similarity: list[float] = []
         self.last_generation_parent_child_mean_similarity: list[float] = []
         self.last_generation_parent_child_examples: list[list[dict]] = []
+        self.last_generation_mutation_counts: list[int] = []
+        self.last_generation_strong_mutation_counts: list[int] = []
         self.score_weights = None
         self._edge_list: list[tuple[int, int]] = []
         self._num_parts: int = 0
@@ -109,13 +116,18 @@ class GASolver:
         self.last_generation_mean_raw_scores = [float(np.mean(raw_scores))]
         self.last_generation_unique_raw_score_counts = [self._count_unique_raw_scores(raw_scores)]
         self.last_generation_unique_grouping_counts = [self._count_unique_groupings(pop)]
+        self.last_generation_duplicate_grouping_ratios = [self._duplicate_grouping_ratio(pop)]
         self.last_generation_best_grouping_changed = [0]
         self.last_generation_parent_child_similarity = [float("nan")]
         self.last_generation_parent_child_mean_similarity = [float("nan")]
         self.last_generation_parent_child_examples = [[]]
+        self.last_generation_mutation_counts = [0]
+        self.last_generation_strong_mutation_counts = [0]
 
         cxpb = 0.9
         for generation in range(1, self.generations + 1):
+            self._current_generation_mutation_count = 0
+            self._current_generation_strong_mutation_count = 0
             elites = [toolbox.clone(ind) for ind in tools.selBest(pop, effective_elite_size)]
             offspring = self._select_tournament(
                 pop,
@@ -172,6 +184,7 @@ class GASolver:
             self.last_generation_mean_raw_scores.append(float(np.mean(raw_scores)))
             self.last_generation_unique_raw_score_counts.append(self._count_unique_raw_scores(raw_scores))
             self.last_generation_unique_grouping_counts.append(self._count_unique_groupings(pop))
+            self.last_generation_duplicate_grouping_ratios.append(self._duplicate_grouping_ratio(pop))
             self.last_generation_best_grouping_changed.append(int(gen_best_grouping_key != best_grouping_key))
             self.last_generation_parent_child_similarity.append(
                 float(np.mean(parent_child_best_similarities)) if parent_child_best_similarities else float("nan")
@@ -180,6 +193,10 @@ class GASolver:
                 float(np.mean(parent_child_mean_similarities)) if parent_child_mean_similarities else float("nan")
             )
             self.last_generation_parent_child_examples.append(parent_child_examples)
+            self.last_generation_mutation_counts.append(getattr(self, "_current_generation_mutation_count", 0))
+            self.last_generation_strong_mutation_counts.append(
+                getattr(self, "_current_generation_strong_mutation_count", 0)
+            )
             if gen_best_score > best_score:
                 best_score = gen_best_score
                 best_sol = gen_best_sol
@@ -254,7 +271,16 @@ class GASolver:
         return ind1, ind2
 
     def _mutate_individual(self, ind, inst):
-        child = self._stabilize_child(self._mutate(self._as_array(ind), inst), self._as_array(ind), inst)
+        self._current_generation_mutation_count = getattr(self, "_current_generation_mutation_count", 0) + 1
+        use_strong = self.rng.random() < self.strong_mutation_prob
+        if use_strong:
+            self._current_generation_strong_mutation_count = (
+                getattr(self, "_current_generation_strong_mutation_count", 0) + 1
+            )
+            mutated = self._mutate_strong(self._as_array(ind), inst)
+        else:
+            mutated = self._mutate(self._as_array(ind), inst)
+        child = self._stabilize_child(mutated, self._as_array(ind), inst)
         ind[:] = child.tolist()
         return (ind,)
 
@@ -298,6 +324,8 @@ class GASolver:
         plt.close(fig)
         diagnostics_path = save_path.replace(".png", "_diagnostics.png")
         self.plot_diagnostics_history(diagnostics_path, show=show)
+        diagnostics_csv_path = save_path.replace(".png", "_diagnostics.csv")
+        self.save_generation_diagnostics(diagnostics_csv_path)
         examples_path = save_path.replace(".png", "_parent_child_examples.csv")
         self.save_parent_child_similarity_examples(examples_path)
         return save_path
@@ -312,7 +340,7 @@ class GASolver:
         import matplotlib.pyplot as plt
 
         generations = list(range(len(self.last_generation_best_scores)))
-        fig, axes = plt.subplots(4, 1, figsize=(7.5, 10.0), sharex=True)
+        fig, axes = plt.subplots(5, 1, figsize=(7.5, 12.0), sharex=True)
 
         axes[0].plot(generations, self.last_generation_unique_raw_score_counts, linewidth=1.8)
         axes[0].set_ylabel("Unique Raw")
@@ -323,28 +351,33 @@ class GASolver:
         axes[1].set_ylabel("Unique Groupings")
         axes[1].grid(True, alpha=0.3)
 
-        axes[2].step(generations, self.last_generation_best_grouping_changed, where="mid", linewidth=1.8)
-        axes[2].set_ylabel("Best Changed")
+        axes[2].plot(generations, self.last_generation_duplicate_grouping_ratios, linewidth=1.8)
+        axes[2].set_ylabel("Duplicate Ratio")
+        axes[2].set_ylim(0.0, 1.05)
         axes[2].grid(True, alpha=0.3)
 
-        axes[3].plot(
+        axes[3].step(generations, self.last_generation_best_grouping_changed, where="mid", linewidth=1.8)
+        axes[3].set_ylabel("Best Changed")
+        axes[3].grid(True, alpha=0.3)
+
+        axes[4].plot(
             generations,
             self.last_generation_parent_child_similarity,
             label="Best Parent Similarity",
             linewidth=1.8,
         )
-        axes[3].plot(
+        axes[4].plot(
             generations,
             self.last_generation_parent_child_mean_similarity,
             label="Mean Parent Similarity",
             linewidth=1.4,
             alpha=0.8,
         )
-        axes[3].set_xlabel("Generation")
-        axes[3].set_ylabel("Parent-Child Sim.")
-        axes[3].set_ylim(0.0, 1.05)
-        axes[3].grid(True, alpha=0.3)
-        axes[3].legend(loc="best")
+        axes[4].set_xlabel("Generation")
+        axes[4].set_ylabel("Parent-Child Sim.")
+        axes[4].set_ylim(0.0, 1.05)
+        axes[4].grid(True, alpha=0.3)
+        axes[4].legend(loc="best")
 
         fig.tight_layout()
         fig.savefig(save_path, dpi=150)
@@ -429,6 +462,12 @@ class GASolver:
 
     def _count_unique_groupings(self, pop) -> int:
         return len({self._solution_key(self._as_array(ind)) for ind in pop})
+
+    def _duplicate_grouping_ratio(self, pop) -> float:
+        if not pop:
+            return 0.0
+        unique_count = self._count_unique_groupings(pop)
+        return 1.0 - (unique_count / float(len(pop)))
 
     def _record_parent_child_similarity(
         self,
@@ -519,6 +558,53 @@ class GASolver:
             writer.writerows(rows)
         return save_path
 
+    def save_generation_diagnostics(
+        self,
+        save_path: str = "ga_generation_diagnostics.csv",
+    ) -> str:
+        generations = list(range(len(self.last_generation_best_scores)))
+        fieldnames = [
+            "generation",
+            "best_raw_fitness",
+            "mean_raw_fitness",
+            "unique_raw_score_count",
+            "unique_grouping_count",
+            "duplicate_grouping_ratio",
+            "best_grouping_changed",
+            "parent_child_best_similarity",
+            "parent_child_mean_similarity",
+            "mutation_count",
+            "strong_mutation_count",
+            "strong_mutation_ratio",
+        ]
+        rows = []
+        for idx, generation in enumerate(generations):
+            mutation_count = self.last_generation_mutation_counts[idx]
+            strong_mutation_count = self.last_generation_strong_mutation_counts[idx]
+            rows.append(
+                {
+                    "generation": generation,
+                    "best_raw_fitness": self.last_generation_best_raw_scores[idx],
+                    "mean_raw_fitness": self.last_generation_mean_raw_scores[idx],
+                    "unique_raw_score_count": self.last_generation_unique_raw_score_counts[idx],
+                    "unique_grouping_count": self.last_generation_unique_grouping_counts[idx],
+                    "duplicate_grouping_ratio": self.last_generation_duplicate_grouping_ratios[idx],
+                    "best_grouping_changed": self.last_generation_best_grouping_changed[idx],
+                    "parent_child_best_similarity": self.last_generation_parent_child_similarity[idx],
+                    "parent_child_mean_similarity": self.last_generation_parent_child_mean_similarity[idx],
+                    "mutation_count": mutation_count,
+                    "strong_mutation_count": strong_mutation_count,
+                    "strong_mutation_ratio": (
+                        strong_mutation_count / float(mutation_count) if mutation_count > 0 else 0.0
+                    ),
+                }
+            )
+        with open(save_path, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(rows)
+        return save_path
+
     def _group_penalty(self, group: list[int], inst) -> float:
         penalty = 0.0
 
@@ -600,6 +686,16 @@ class GASolver:
         if op == "split":
             return self._mutate_split_edges(child, inst)
         return self._mutate_merge_edges(child, inst)
+
+    def _mutate_strong(self, sol: np.ndarray, inst) -> np.ndarray:
+        child = self._canonicalize(sol.copy())
+        for _ in range(self.strong_mutation_steps):
+            previous = child.copy()
+            child = self._mutate(child, inst)
+            if np.array_equal(child, previous):
+                child = self._mutate_relaxed(child)
+            child = self._canonicalize(child)
+        return child
 
     def _mutate_relaxed(self, sol: np.ndarray) -> np.ndarray:
         child = self._canonicalize(sol.copy())
