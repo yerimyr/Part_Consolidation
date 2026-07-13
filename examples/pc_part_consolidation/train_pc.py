@@ -369,11 +369,11 @@ def main():
     epochs = 100
     lr = 1e-4
     grad_clip = 1.0
-    entropy_coef = 0.05
-    temperature = 2.0
+    entropy_coef = 0.03
+    temperature = 1.5
     mutation_frac = 0.10
     mutation_attempts = 1
-    mutation_loss_weight = 0.30
+    mutation_loss_weight = 0.10
     mutation_accept_worse = True
     mutation_worse_accept_prob = 0.20
     mutation_worse_weight = 0.02
