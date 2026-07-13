@@ -37,7 +37,7 @@ class PCPolicy(nn.Module):
         self,
         node_feat_dim: int,
         edge_feat_dim: int,
-        emb_dim: int = 128,
+        emb_dim: int = 256,
         num_message_passing: int = 3,
         temperature: float = 1.2,
         num_decoder_layers: int = 2,

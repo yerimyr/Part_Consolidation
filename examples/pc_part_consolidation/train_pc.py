@@ -363,20 +363,20 @@ def main():
     # =========================
     # Hyperparameters
     # =========================
-    batch_size = 256
+    batch_size = 128
     eval_batch_size = 128
     eval_seed = 4321
-    epochs = 500
-    lr = 1e-4
-    grad_clip = 1.0
-    entropy_coef = 0.05
-    temperature = 2.0
-    mutation_frac = 0.10
-    mutation_attempts = 1
-    mutation_loss_weight = 0.30
+    epochs = 300
+    lr = 2.2517366690306955e-05
+    grad_clip = 0.6505809213846117
+    entropy_coef = 0.029665918639132885
+    temperature = 1.8765736586548174
+    mutation_frac = 0.00436749514643062
+    mutation_attempts = 3
+    mutation_loss_weight = 0.13857133524590753
     mutation_accept_worse = True
-    mutation_worse_accept_prob = 0.20
-    mutation_worse_weight = 0.02
+    mutation_worse_accept_prob = 0.34865277412320644
+    mutation_worse_weight = 0.01138161583466478
 
     # =========================
     # TensorBoard

@@ -945,7 +945,7 @@ def main():
 
     gen = FPIGenerator(**generator_params)
     env = PartConsolidationEnv(generator=gen, device=device)
-    fixed_instance_seed = 1  # 1
+    fixed_instance_seed = 1107  # 1
     fixed_ga_seed = 5
     ckpt = Path("checkpoints") / "best_model.pt"
     policy = load_policy(gen, device, ckpt)
@@ -965,7 +965,7 @@ def main():
     gen_results = run_generalization(
         env,
         policy,
-        num_instances=100,
+        num_instances=15,
         min_parts=generator_params["num_parts"],
         max_parts=generator_params["max_num_parts"],
     )
