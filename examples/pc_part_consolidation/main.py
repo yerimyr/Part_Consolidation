@@ -906,6 +906,7 @@ def load_policy(gen, device, ckpt_path):
     policy = PCPolicy(
         node_feat_dim=gen.node_feat_dim,
         edge_feat_dim=gen.edge_feat_dim,
+        emb_dim=128,
     ).to(device)
 
     ckpt_path = Path(ckpt_path)
@@ -965,7 +966,7 @@ def main():
     gen_results = run_generalization(
         env,
         policy,
-        num_instances=15,
+        num_instances=100,
         min_parts=generator_params["num_parts"],
         max_parts=generator_params["max_num_parts"],
     )

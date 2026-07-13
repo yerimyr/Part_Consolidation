@@ -366,17 +366,17 @@ def main():
     batch_size = 128
     eval_batch_size = 128
     eval_seed = 4321
-    epochs = 300
-    lr = 2.2517366690306955e-05
-    grad_clip = 0.6505809213846117
-    entropy_coef = 0.029665918639132885
-    temperature = 1.8765736586548174
-    mutation_frac = 0.00436749514643062
-    mutation_attempts = 3
-    mutation_loss_weight = 0.13857133524590753
+    epochs = 100
+    lr = 1e-4
+    grad_clip = 1.0
+    entropy_coef = 0.05
+    temperature = 2.0
+    mutation_frac = 0.10
+    mutation_attempts = 1
+    mutation_loss_weight = 0.30
     mutation_accept_worse = True
-    mutation_worse_accept_prob = 0.34865277412320644
-    mutation_worse_weight = 0.01138161583466478
+    mutation_worse_accept_prob = 0.20
+    mutation_worse_weight = 0.02
 
     # =========================
     # TensorBoard
@@ -512,7 +512,7 @@ def main():
                 max_steps=max_steps,
                 sample=False,
                 epsilon=0.0,
-        )
+            )
         policy.train()
         sampling_time_sec = time.perf_counter() - sampling_time_start
 
@@ -663,6 +663,7 @@ def main():
             print(
                 f"[{ep:5d}] "
                 f"train_total={total_reward.mean().item():.4f} "
+                f"train_greedy={reward_greedy.mean().item():.4f} "
                 f"eval_greedy={avg_eval:.4f} "
                 f"train_feasible={reward_metrics['feasible'].mean().item():.3f} "
                 f"eval_feasible={eval_metrics['feasible'].mean().item():.3f} "

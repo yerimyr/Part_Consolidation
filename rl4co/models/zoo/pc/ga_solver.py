@@ -27,7 +27,7 @@ class GASolver:
     def __init__(
         self,
         pop_size: int = 120,
-        generations: int = 18000,
+        generations: int = 300,  # 18000
         elite_size: int = 0,
         tournament_size: int = 2,
         mutation_rate: float = 0.30,
