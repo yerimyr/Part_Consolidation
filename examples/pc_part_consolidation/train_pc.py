@@ -43,33 +43,74 @@ def rollout_episode_from_td(
 ):
     env._reward_static_td = td_init.clone().to(env.device)
     td = td_init.clone().to(env.device)
-
     actions = []
     logps = []
     entropies = []
     step_counts = torch.zeros((td.batch_size[0],), dtype=torch.float32, device=env.device)
-
     for _ in range(max_steps):
         active = ~td["done"].view(-1)
         action, logp, entropy, _ = policy.act(td, sample=sample, epsilon=epsilon)
         actions.append(action)
         logps.append(logp)
         entropies.append(entropy)
-
         td = env.step(td, action)
         step_counts = step_counts + active.float()
-
         if td["done"].all():
             break
-
     actions = torch.stack(actions, dim=1)
     logps = torch.stack(logps, dim=1)
     entropies = torch.stack(entropies, dim=1)
-
     terminal_reward = env.reward_from_actions(actions)
     total_reward = terminal_reward
-
     return actions, logps, entropies, terminal_reward, total_reward, td, step_counts
+
+
+def pad_rollout_tensor(x: torch.Tensor, target_steps: int, value: float = 0.0) -> torch.Tensor:
+    if x.size(1) == target_steps:
+        return x
+    if x.size(1) > target_steps:
+        return x[:, :target_steps]
+    pad = x.new_full((x.size(0), target_steps - x.size(1)), value)
+    return torch.cat([x, pad], dim=1)
+
+
+def logprob_entropy_of_action_tensor(
+    env: PartConsolidationEnv,
+    policy: PCPolicy,
+    td_init,
+    action_tensor: torch.Tensor,
+    lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    td = td_init.clone()
+    batch = action_tensor.size(0)
+    logp_sum = torch.zeros((batch,), dtype=torch.float32, device=action_tensor.device)
+    entropy_sum = torch.zeros((), dtype=torch.float32, device=action_tensor.device)
+    active_count = torch.zeros((), dtype=torch.float32, device=action_tensor.device)
+
+    for t in range(action_tensor.size(1)):
+        active = (t < lengths) & (~td["done"].view(-1))
+        if not bool(active.any().item()):
+            break
+
+        node_emb = policy.encode(td)
+        logits = policy.compute_logits(node_emb, td) / policy.temperature
+        mask = td["action_mask"].clone()
+        no_valid = ~mask.any(dim=-1)
+        if no_valid.any():
+            mask[no_valid, 0] = True
+        logits = logits.masked_fill(~mask, -1e9)
+        probs = torch.softmax(logits, dim=-1)
+
+        action = action_tensor[:, t].long()
+        chosen = probs.gather(1, action.view(-1, 1)).clamp_min(1e-12).squeeze(-1)
+        logp_sum = logp_sum + torch.where(active, torch.log(chosen), torch.zeros_like(logp_sum))
+        entropy_step = -(probs.clamp_min(1e-12) * probs.clamp_min(1e-12).log()).sum(dim=-1)
+        entropy_sum = entropy_sum + entropy_step[active].sum()
+        active_count = active_count + active.float().sum()
+        td = env.step(td, action)
+
+    entropy_mean = entropy_sum / active_count.clamp_min(1.0)
+    return logp_sum, entropy_mean
 
 
 def make_fixed_eval_td(
@@ -80,7 +121,6 @@ def make_fixed_eval_td(
 ):
     cpu_rng_state = torch.random.get_rng_state()
     cuda_rng_states = torch.cuda.get_rng_state_all() if torch.cuda.is_available() else None
-
     try:
         torch.manual_seed(seed)
         if torch.cuda.is_available():
@@ -109,10 +149,8 @@ def mutate_grouping_once(env: PartConsolidationEnv, td_static, batch_idx: int, g
     groups = [sorted(group) for group in groups if group]
     if not groups:
         return None
-
     ops = ["split", "merge"]
     random.shuffle(ops)
-
     for op in ops:
         if op == "merge" and len(groups) >= 2:
             pairs = [(i, j) for i in range(len(groups)) for j in range(i + 1, len(groups))]
@@ -124,7 +162,6 @@ def mutate_grouping_once(env: PartConsolidationEnv, td_static, batch_idx: int, g
                 next_groups = [g[:] for k, g in enumerate(groups) if k not in (i, j)]
                 next_groups.append(merged)
                 return [sorted(g) for g in next_groups]
-
         if op == "split":
             candidates = [idx for idx, group in enumerate(groups) if len(group) >= 2]
             random.shuffle(candidates)
@@ -142,7 +179,6 @@ def mutate_grouping_once(env: PartConsolidationEnv, td_static, batch_idx: int, g
                     next_groups = [g[:] for k, g in enumerate(groups) if k != idx]
                     next_groups.extend([sorted(left), right])
                     return [sorted(g) for g in next_groups]
-
     return None
 
 
@@ -164,7 +200,6 @@ def grouping_to_action_sequence(
 ):
     td = td_single.clone()
     actions = []
-
     for group in [sorted(g) for g in groups if len(g) >= 2]:
         base = group[0]
         pending = group[1:]
@@ -172,34 +207,28 @@ def grouping_to_action_sequence(
             group_id = td["group_id"][0]
             base_gid = int(group_id[base].item())
             matched = False
-
             for node in list(pending):
                 node_gid = int(group_id[node].item())
                 if base_gid < 0 or node_gid < 0 or base_gid == node_gid:
                     pending.remove(node)
                     matched = True
                     break
-
                 pair = tuple(sorted((base_gid, node_gid)))
                 if pair not in env.group_pair_list:
                     continue
                 action = env.group_pair_list.index(pair) + 1
                 if not bool(td["action_mask"][0, action].item()):
                     continue
-
                 action_tensor = torch.tensor([action], dtype=torch.long, device=td["group_id"].device)
                 actions.append(action)
                 td = env.step(td, action_tensor)
                 pending.remove(node)
                 matched = True
                 break
-
             if not matched:
                 return None
-
             if len(actions) >= max_steps:
                 return None
-
     if len(actions) < max_steps:
         actions.append(0)
     return actions
@@ -214,21 +243,17 @@ def logprob_of_action_sequences(
     device = td_init["group_id"].device
     if not action_sequences:
         return torch.empty((0,), dtype=torch.float32, device=device)
-
     lengths = torch.tensor([len(seq) for seq in action_sequences], dtype=torch.long, device=device)
     max_len = int(lengths.max().item())
     action_tensor = torch.zeros((len(action_sequences), max_len), dtype=torch.long, device=device)
     for idx, seq in enumerate(action_sequences):
         action_tensor[idx, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=device)
-
     td = td_init.clone()
     logp_sum = torch.zeros((len(action_sequences),), dtype=torch.float32, device=device)
-
     for t in range(max_len):
         active = t < lengths
         if not bool(active.any().item()):
             break
-
         node_emb = policy.encode(td)
         logits = policy.compute_logits(node_emb, td) / policy.temperature
         mask = td["action_mask"].clone()
@@ -237,12 +262,10 @@ def logprob_of_action_sequences(
             mask[no_valid, 0] = True
         logits = logits.masked_fill(~mask, -1e9)
         probs = torch.softmax(logits, dim=-1)
-
         action = action_tensor[:, t]
         chosen = probs.gather(1, action.view(-1, 1)).clamp_min(1e-12).squeeze(-1)
         logp_sum = logp_sum + torch.where(active, torch.log(chosen), torch.zeros_like(logp_sum))
         td = env.step(td, action)
-
     return logp_sum
 
 
@@ -271,24 +294,20 @@ def compute_mutation_auxiliary_loss(
             "worse_kept_count": 0,
             "worse_accept_ratio": 0.0,
         }
-
     selected_count = min(batch_size, selected_count)
     selected = torch.randperm(batch_size, device=sampled_actions.device)[:selected_count].tolist()
     sampled_groups = env.actions_to_groups(sampled_actions, N=env.N)
-
     kept_indices = []
     action_sequences = []
     weights = []
     gains = []
     improved_count = 0
     worse_kept_count = 0
-
     with torch.no_grad():
         for batch_idx in selected:
             base_groups = sampled_groups[batch_idx]
             best_groups = None
             best_gain = None
-
             for _ in range(mutation_attempts):
                 mutated = mutate_grouping_once(env, td_static, batch_idx, base_groups)
                 if mutated is None:
@@ -298,10 +317,8 @@ def compute_mutation_auxiliary_loss(
                 if best_gain is None or gain > best_gain:
                     best_gain = gain
                     best_groups = mutated
-
             if best_groups is None or best_gain is None:
                 continue
-
             improved = bool((best_gain > 0).item())
             if improved:
                 sequence_weight = best_gain.detach()
@@ -313,7 +330,6 @@ def compute_mutation_auxiliary_loss(
                     continue
                 sequence_weight = sampled_reward.new_tensor(float(mutation_worse_weight))
                 worse_kept_count += 1
-
             seq = grouping_to_action_sequence(
                 env=env,
                 td_single=td_static[batch_idx : batch_idx + 1],
@@ -322,12 +338,10 @@ def compute_mutation_auxiliary_loss(
             )
             if seq is None:
                 continue
-
             action_sequences.append(seq)
             kept_indices.append(batch_idx)
             weights.append(sequence_weight)
             gains.append(float(best_gain.detach().item()))
-
     if not action_sequences:
         zero = sampled_reward.new_tensor(0.0)
         return zero, {
@@ -338,12 +352,10 @@ def compute_mutation_auxiliary_loss(
             "worse_kept_count": 0,
             "worse_accept_ratio": 0.0,
         }
-
     selected_td = torch.cat([td_static[idx : idx + 1] for idx in kept_indices], dim=0)
     weight_tensor = torch.stack(weights).to(sampled_actions.device)
     logp_mut = logprob_of_action_sequences(env, policy, selected_td, action_sequences)
     loss_mut = -(weight_tensor.detach() * logp_mut).mean()
-
     return loss_mut, {
         "applied_ratio": selected_count / float(batch_size),
         "improved_ratio": improved_count / float(selected_count),
@@ -356,17 +368,15 @@ def compute_mutation_auxiliary_loss(
 
 def main():
     train_start_time = time.time()
-
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
-
     # =========================
     # Hyperparameters
     # =========================
-    batch_size = 128
+    batch_size = 64
     eval_batch_size = 128
     eval_seed = 4321
-    epochs = 100
+    epochs = 1000
     lr = 1e-4
     grad_clip = 1.0
     entropy_coef = 0.03
@@ -375,16 +385,19 @@ def main():
     mutation_attempts = 1
     mutation_loss_weight = 0.10
     mutation_accept_worse = True
-    mutation_worse_accept_prob = 0.20
+    mutation_worse_accept_prob = 0.10
     mutation_worse_weight = 0.02
-
+    baseline_mode = "sampling"  # "greedy" or "sampling"
+    baseline_num_samples = 8
     # =========================
     # TensorBoard
     # =========================
-    log_dir = f"runs/pc_general_graph_groupcount_{int(time.time())}"
-    writer = SummaryWriter(log_dir=log_dir)
+    runs_root = PROJECT_ROOT / "runs"
+    run_name = f"pc_general_graph_groupcount_{int(time.time())}"
+    log_dir = runs_root / run_name
+    writer = SummaryWriter(log_dir=str(log_dir))
     print("TensorBoard log dir:", log_dir)
-    timing_csv_path = Path(log_dir) / "timing_by_epoch.csv"
+    timing_csv_path = log_dir / "timing_by_epoch.csv"
     timing_csv_path.parent.mkdir(parents=True, exist_ok=True)
     with timing_csv_path.open("w", newline="", encoding="utf-8") as f:
         writer_csv = csv.writer(f)
@@ -394,11 +407,11 @@ def main():
                 "batch_index",
                 "batch_size",
                 "problem_generation_and_transfer_sec",
-                "sampling_and_greedy_sec",
+                "sampling_and_baseline_sec",
                 "learning_sec",
                 "epoch_sec",
                 "cumulative_problem_generation_and_transfer_sec",
-                "cumulative_sampling_and_greedy_sec",
+                "cumulative_sampling_and_baseline_sec",
                 "cumulative_learning_sec",
                 "cumulative_epoch_sec",
                 "cumulative_stage_sum_sec",
@@ -413,16 +426,13 @@ def main():
             ]
         )
     print("Timing CSV:", timing_csv_path)
-
     # =========================
-    # 🔥 [추가] 모델 저장 설정
+    # ?�� [추�?] 모델 ?�???�정
     # =========================
     save_dir = Path("checkpoints")
     save_dir.mkdir(parents=True, exist_ok=True)
-
     best_model_path = save_dir / "best_model.pt"
     best_eval_reward = -1e9
-
     # =========================
     # Environment / Model
     # =========================
@@ -444,14 +454,12 @@ def main():
         p_maint_H=0.10,
         p_standard=0.10,
     )
-
     gen = FPIGenerator(**generator_params)
     env = PartConsolidationEnv(
         generator=gen,
         min_group_size_before_sep=1,
         device=device,
     )
-
     policy = PCPolicy(
         node_feat_dim=gen.node_feat_dim,
         edge_feat_dim=gen.edge_feat_dim,
@@ -459,7 +467,6 @@ def main():
         num_message_passing=3,
         temperature=temperature,
     ).to(device)
-
     optimizer = optim.Adam(policy.parameters(), lr=lr)
     max_steps = gen.max_num_parts
     td_eval_fixed = make_fixed_eval_td(
@@ -469,7 +476,6 @@ def main():
         device=device,
     )
     print(f"Fixed eval batch: size={eval_batch_size}, seed={eval_seed}")
-
     # =========================
     # Training Loop
     # =========================
@@ -481,7 +487,6 @@ def main():
         epoch_time_start = time.perf_counter()
         policy.train()
         policy.temperature = float(temperature)
-
         generation_time_start = time.perf_counter()
         td_generated = env.reset(batch_size)
         generation_device = tensor_device_name(td_generated["material"])
@@ -489,47 +494,79 @@ def main():
         problem_input_device = tensor_device_name(td0["material"])
         policy_device = first_parameter_device(policy)
         generation_time_sec = time.perf_counter() - generation_time_start
-
         sampling_time_start = time.perf_counter()
-        actions, logps, entropies, terminal_reward, total_reward, _, step_counts = rollout_episode_from_td(
-            env=env,
-            policy=policy,
-            td_init=td0,
-            max_steps=max_steps,
-            sample=True,
-            epsilon=0.0,
-        )
-        sampling_action_device = tensor_device_name(actions)
-        sampling_logp_device = tensor_device_name(logps)
-
-        # greedy baseline
-        policy.eval()
-        with torch.no_grad():
-            _, _, _, reward_greedy, _, _, _ = rollout_episode_from_td(
+        if baseline_mode == "greedy":
+            actions, logps, entropies, terminal_reward, total_reward, _, step_counts = rollout_episode_from_td(
                 env=env,
                 policy=policy,
                 td_init=td0,
                 max_steps=max_steps,
-                sample=False,
+                sample=True,
                 epsilon=0.0,
             )
-        policy.train()
-        sampling_time_sec = time.perf_counter() - sampling_time_start
+            sampling_action_device = tensor_device_name(actions)
+            sampling_logp_device = tensor_device_name(logps)
+            td_static_for_mutation = td0
+            mutation_actions = actions
+            mutation_reward = terminal_reward.detach()
+            policy.eval()
+            with torch.no_grad():
+                _, _, _, reward_baseline, _, _, _ = rollout_episode_from_td(
+                    env=env,
+                    policy=policy,
+                    td_init=td0,
+                    max_steps=max_steps,
+                    sample=False,
+                    epsilon=0.0,
+                )
+            policy.train()
+            baseline_log_value = reward_baseline.mean().item()
+            shared_baseline_gap = 0.0
+        elif baseline_mode == "sampling":
+            sample_count = int(baseline_num_samples)
+            if sample_count <= 1:
+                raise ValueError("baseline_num_samples must be greater than 1 when baseline_mode='sampling'")
 
+            td_rollout = torch.cat([td0] * sample_count, dim=0)
+            actions, logps, entropies, terminal_reward, total_reward, _, step_counts = rollout_episode_from_td(
+                env=env,
+                policy=policy,
+                td_init=td_rollout,
+                max_steps=max_steps,
+                sample=True,
+                epsilon=0.0,
+            )
+            sampling_action_device = tensor_device_name(actions)
+            sampling_logp_device = tensor_device_name(logps)
+            td_static_for_mutation = td_rollout
+            mutation_actions = actions
+            mutation_reward = terminal_reward.detach()
+
+            reward_matrix = total_reward.view(sample_count, batch_size)
+            shared_baseline = reward_matrix.mean(dim=0, keepdim=True)
+            reward_baseline = shared_baseline.expand(sample_count, batch_size).reshape(-1)
+            baseline_log_value = shared_baseline.mean().item()
+            shared_baseline_gap = (reward_matrix.max(dim=0).values - shared_baseline.squeeze(0)).mean().item()
+        else:
+            raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
+        sampling_time_sec = time.perf_counter() - sampling_time_start
         learning_time_start = time.perf_counter()
-        advantage = total_reward - reward_greedy
+        advantage = total_reward - reward_baseline
         advantage_norm = (advantage - advantage.mean()) / advantage.std(unbiased=False).clamp_min(1e-8)
         logp_sum = logps.sum(dim=1)
         entropy_mean = entropies.mean()
-        reward_metrics = env.reward_metrics_from_actions(actions)
-
         loss_pg = -(advantage_norm.detach() * logp_sum).mean()
+
+        old_static_td = env._reward_static_td
+        env._reward_static_td = td_static_for_mutation
+        reward_metrics = env.reward_metrics_from_actions(actions)
+        env._reward_static_td = old_static_td
         loss_mutation, mutation_stats = compute_mutation_auxiliary_loss(
             env=env,
             policy=policy,
-            td_static=td0,
-            sampled_actions=actions,
-            sampled_reward=terminal_reward.detach(),
+            td_static=td_static_for_mutation,
+            sampled_actions=mutation_actions,
+            sampled_reward=mutation_reward,
             mutation_frac=mutation_frac,
             mutation_attempts=mutation_attempts,
             mutation_accept_worse=mutation_accept_worse,
@@ -537,9 +574,9 @@ def main():
             mutation_worse_weight=mutation_worse_weight,
             max_steps=max_steps,
         )
+
         loss = loss_pg + mutation_loss_weight * loss_mutation - entropy_coef * entropy_mean
         loss_device = tensor_device_name(loss)
-
         if ep == 1:
             device_report = (
                 "Stage 1 - problem instance generation\n"
@@ -555,7 +592,6 @@ def main():
             )
             print("\n===== DEVICE STAGE REPORT =====")
             print(device_report)
-
         optimizer.zero_grad()
         loss.backward()
         torch.nn.utils.clip_grad_norm_(policy.parameters(), grad_clip)
@@ -599,9 +635,8 @@ def main():
                     loss_device,
                 ]
             )
-
         # =========================
-        # 🔥 [추가] checkpoint 저장
+        # ?�� [추�?] checkpoint ?�??
         # =========================
         if ep % 100 == 0:
             torch.save({
@@ -609,9 +644,9 @@ def main():
                 "policy": policy.state_dict(),
                 "optimizer": optimizer.state_dict(),
             }, save_dir / f"pc_model_ep{ep}.pt")
-
         writer.add_scalar("train/reward_total", total_reward.mean().item(), ep)
-        writer.add_scalar("train/reward_greedy", reward_greedy.mean().item(), ep)
+        writer.add_scalar("train/reward_baseline", baseline_log_value, ep)
+        writer.add_scalar("train/shared_baseline_best_gap", shared_baseline_gap, ep)
         writer.add_scalar("train/episode_steps_mean", step_counts.mean().item(), ep)
         writer.add_scalar("train/loss", loss.item(), ep)
         writer.add_scalar("train/loss_pg", loss_pg.item(), ep)
@@ -625,7 +660,6 @@ def main():
         writer.add_scalar("train/advantage_mean", advantage.mean().item(), ep)
         writer.add_scalar("train/advantage_std", advantage.std(unbiased=False).item(), ep)
         writer.add_scalar("train/num_groups", reward_metrics["num_groups"].mean().item(), ep)
-
         if ep % 10 == 0:
             policy.eval()
             with torch.no_grad():
@@ -638,32 +672,27 @@ def main():
                     epsilon=0.0,
                 )
                 eval_metrics = env.reward_metrics_from_actions(actions_eval)
-
             avg_eval = reward_eval.mean().item()
-
             writer.add_scalar("eval/reward_total", avg_eval, ep)
             writer.add_scalar("eval/reward_greedy", avg_eval, ep)
             writer.add_scalar("eval/num_groups", eval_metrics["num_groups"].mean().item(), ep)
-
             # =========================
-            # 🔥 [추가] BEST MODEL 저장
+            # ?�� [추�?] BEST MODEL ?�??
             # =========================
             if avg_eval > best_eval_reward:
                 best_eval_reward = avg_eval
-
                 torch.save({
                     "epoch": ep,
                     "policy": policy.state_dict(),
                     "optimizer": optimizer.state_dict(),
                     "best_reward": best_eval_reward,
                 }, best_model_path)
-
-                print(f"🔥 BEST MODEL UPDATED @ ep {ep} | reward={avg_eval:.4f}")
-
+                print(f"?�� BEST MODEL UPDATED @ ep {ep} | reward={avg_eval:.4f}")
             print(
                 f"[{ep:5d}] "
                 f"train_total={total_reward.mean().item():.4f} "
-                f"train_greedy={reward_greedy.mean().item():.4f} "
+                f"train_baseline={baseline_log_value:.4f} "
+                f"baseline_mode={baseline_mode} "
                 f"eval_greedy={avg_eval:.4f} "
                 f"train_feasible={reward_metrics['feasible'].mean().item():.3f} "
                 f"eval_feasible={eval_metrics['feasible'].mean().item():.3f} "
@@ -683,7 +712,6 @@ def main():
                 f"wall={wall_clock_elapsed_sec:.1f}s "
                 f"unaccounted={unaccounted_wall_clock_sec:.1f}s"
             )
-
     writer.close()
     total_train_time = time.time() - train_start_time
     print(f"Training wall time: {total_train_time:.2f}s ({total_train_time / 60:.2f} min)")
