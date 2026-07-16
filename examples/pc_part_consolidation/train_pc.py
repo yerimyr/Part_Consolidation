@@ -74,6 +74,124 @@ def pad_rollout_tensor(x: torch.Tensor, target_steps: int, value: float = 0.0) -
     return torch.cat([x, pad], dim=1)
 
 
+def select_initial_merge_start_actions(
+    env: PartConsolidationEnv,
+    td,
+    num_starts: int,
+    top_ratio: float = 0.5,
+) -> torch.Tensor:
+    """Select feasible initial merge actions for merge-start POMO.
+
+    Returns action ids with shape [batch_size, num_starts]. Action 0 is used
+    only as a fallback when an instance has no feasible initial merge.
+    """
+    action_mask = td["action_mask"][:, 1:]
+    device = action_mask.device
+    batch_size, num_pairs = action_mask.shape
+    if num_pairs == 0:
+        return torch.zeros((batch_size, num_starts), dtype=torch.long, device=device)
+
+    pair_ga, pair_gb = env._pair_tensors(device)
+    pair_score = td["W"][:, pair_ga, pair_gb]
+    top_count = int(round(num_starts * top_ratio))
+    top_count = max(0, min(num_starts, top_count))
+
+    starts = []
+    for b in range(batch_size):
+        feasible_idx = torch.nonzero(action_mask[b], as_tuple=False).flatten()
+        if feasible_idx.numel() == 0:
+            starts.append(torch.zeros((num_starts,), dtype=torch.long, device=device))
+            continue
+
+        selected = []
+        if top_count > 0:
+            feasible_scores = pair_score[b, feasible_idx]
+            k_top = min(top_count, feasible_idx.numel())
+            top_local = torch.topk(feasible_scores, k=k_top).indices
+            selected.extend(feasible_idx[top_local].tolist())
+
+        remaining = num_starts - len(selected)
+        if remaining > 0:
+            selected_tensor = torch.tensor(selected, dtype=torch.long, device=device) if selected else torch.empty((0,), dtype=torch.long, device=device)
+            if selected_tensor.numel() > 0:
+                is_selected = (feasible_idx[:, None] == selected_tensor[None, :]).any(dim=1)
+                random_pool = feasible_idx[~is_selected]
+            else:
+                random_pool = feasible_idx
+            if random_pool.numel() == 0:
+                random_pool = feasible_idx
+
+            if random_pool.numel() >= remaining:
+                perm = torch.randperm(random_pool.numel(), device=device)[:remaining]
+                random_pick = random_pool[perm]
+            else:
+                draw = torch.randint(0, random_pool.numel(), (remaining,), device=device)
+                random_pick = random_pool[draw]
+            selected.extend(random_pick.tolist())
+
+        selected = selected[:num_starts]
+        while len(selected) < num_starts:
+            selected.append(int(feasible_idx[torch.randint(0, feasible_idx.numel(), (1,), device=device)].item()))
+        starts.append(torch.tensor(selected, dtype=torch.long, device=device) + 1)
+
+    return torch.stack(starts, dim=0)
+
+
+def rollout_policy_actions_from_td(
+    env: PartConsolidationEnv,
+    policy: PCPolicy,
+    td_init,
+    max_steps: int,
+    sample: bool = True,
+    epsilon: float = 0.0,
+):
+    td = td_init.clone().to(env.device)
+    actions = []
+    logps = []
+    entropies = []
+    step_counts = torch.zeros((td.batch_size[0],), dtype=torch.float32, device=env.device)
+
+    for _ in range(max_steps):
+        active = ~td["done"].view(-1)
+        action, logp, entropy, _ = policy.act(td, sample=sample, epsilon=epsilon)
+        actions.append(action)
+        logps.append(logp)
+        entropies.append(entropy)
+        td = env.step(td, action)
+        step_counts = step_counts + active.float()
+        if td["done"].all():
+            break
+
+    if not actions:
+        batch_size = td.batch_size[0]
+        empty_long = torch.empty((batch_size, 0), dtype=torch.long, device=env.device)
+        empty_float = torch.empty((batch_size, 0), dtype=torch.float32, device=env.device)
+        return empty_long, empty_float, empty_float, td, step_counts
+
+    return (
+        torch.stack(actions, dim=1),
+        torch.stack(logps, dim=1),
+        torch.stack(entropies, dim=1),
+        td,
+        step_counts,
+    )
+
+
+def logprob_entropy_for_forced_action(policy: PCPolicy, td, action: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    node_emb = policy.encode(td)
+    logits = policy.compute_logits(node_emb, td) / policy.temperature
+    mask = td["action_mask"].clone()
+    no_valid = ~mask.any(dim=-1)
+    if no_valid.any():
+        mask[no_valid, 0] = True
+    logits = logits.masked_fill(~mask, -1e9)
+    probs = torch.softmax(logits, dim=-1)
+    chosen_prob = probs.gather(1, action.long().view(-1, 1)).clamp_min(1e-12).squeeze(-1)
+    logp = torch.log(chosen_prob)
+    entropy = -(probs * torch.log(probs.clamp_min(1e-12))).sum(dim=-1)
+    return logp, entropy
+
+
 def logprob_entropy_of_action_tensor(
     env: PartConsolidationEnv,
     policy: PCPolicy,
@@ -373,22 +491,28 @@ def main():
     # =========================
     # Hyperparameters
     # =========================
-    batch_size = 64
+    batch_size = 32
     eval_batch_size = 128
     eval_seed = 4321
+    eval_interval = 1
     epochs = 1000
     lr = 1e-4
     grad_clip = 1.0
     entropy_coef = 0.03
     temperature = 1.5
-    mutation_frac = 0.10
+    use_elite_loss = True
+    elite_loss_weight = 0.05
+    elite_top_k = 1
+    mutation_frac = 0.0  # 0.0: mutation=False
     mutation_attempts = 1
-    mutation_loss_weight = 0.10
+    mutation_loss_weight = 0.0  # 0.0: mutation=False
     mutation_accept_worse = True
     mutation_worse_accept_prob = 0.10
     mutation_worse_weight = 0.02
-    baseline_mode = "sampling"  # "greedy" or "sampling"
-    baseline_num_samples = 8
+    baseline_mode = "merge_start_pomo"  # "greedy", "sampling", or "merge_start_pomo"
+    baseline_num_samples = 20
+    merge_start_top_ratio = 0.5
+    eval_merge_start_chunk = 4
     # =========================
     # TensorBoard
     # =========================
@@ -522,6 +646,8 @@ def main():
             policy.train()
             baseline_log_value = reward_baseline.mean().item()
             shared_baseline_gap = 0.0
+            elite_loss_available = False
+            sample_count_for_elite = 1
         elif baseline_mode == "sampling":
             sample_count = int(baseline_num_samples)
             if sample_count <= 1:
@@ -547,6 +673,57 @@ def main():
             reward_baseline = shared_baseline.expand(sample_count, batch_size).reshape(-1)
             baseline_log_value = shared_baseline.mean().item()
             shared_baseline_gap = (reward_matrix.max(dim=0).values - shared_baseline.squeeze(0)).mean().item()
+            elite_loss_available = True
+            sample_count_for_elite = sample_count
+        elif baseline_mode == "merge_start_pomo":
+            sample_count = int(baseline_num_samples)
+            if sample_count <= 1:
+                raise ValueError("baseline_num_samples must be greater than 1 when baseline_mode='merge_start_pomo'")
+
+            start_actions = select_initial_merge_start_actions(
+                env=env,
+                td=td0,
+                num_starts=sample_count,
+                top_ratio=merge_start_top_ratio,
+            )
+            td_rollout = torch.cat([td0] * sample_count, dim=0)
+            forced_start_actions = start_actions.transpose(0, 1).reshape(-1)
+            first_logp, first_entropy = logprob_entropy_for_forced_action(
+                policy=policy,
+                td=td_rollout,
+                action=forced_start_actions,
+            )
+            td_after_start = env.step(td_rollout, forced_start_actions)
+            suffix_actions, suffix_logps, suffix_entropies, _, suffix_step_counts = rollout_policy_actions_from_td(
+                env=env,
+                policy=policy,
+                td_init=td_after_start,
+                max_steps=max_steps - 1,
+                sample=True,
+                epsilon=0.0,
+            )
+            suffix_actions = pad_rollout_tensor(suffix_actions, max_steps - 1, value=0.0)
+            actions = torch.cat([forced_start_actions[:, None], suffix_actions], dim=1)
+            logps = torch.cat([first_logp[:, None], suffix_logps], dim=1)
+            entropies = torch.cat([first_entropy[:, None], suffix_entropies], dim=1)
+            step_counts = suffix_step_counts + 1.0
+
+            env._reward_static_td = td_rollout.clone().to(env.device)
+            terminal_reward = env.reward_from_actions(actions)
+            total_reward = terminal_reward
+            sampling_action_device = tensor_device_name(actions)
+            sampling_logp_device = tensor_device_name(logps)
+            td_static_for_mutation = td_rollout
+            mutation_actions = actions
+            mutation_reward = terminal_reward.detach()
+
+            reward_matrix = total_reward.view(sample_count, batch_size)
+            shared_baseline = reward_matrix.mean(dim=0, keepdim=True)
+            reward_baseline = shared_baseline.expand(sample_count, batch_size).reshape(-1)
+            baseline_log_value = shared_baseline.mean().item()
+            shared_baseline_gap = (reward_matrix.max(dim=0).values - shared_baseline.squeeze(0)).mean().item()
+            elite_loss_available = True
+            sample_count_for_elite = sample_count
         else:
             raise ValueError(f"Unknown baseline_mode: {baseline_mode}")
         sampling_time_sec = time.perf_counter() - sampling_time_start
@@ -556,6 +733,21 @@ def main():
         logp_sum = logps.sum(dim=1)
         entropy_mean = entropies.mean()
         loss_pg = -(advantage_norm.detach() * logp_sum).mean()
+        loss_elite = torch.zeros((), device=loss_pg.device)
+        elite_reward_mean = total_reward.mean().item()
+        elite_reward_gap = 0.0
+        elite_selected_count = 0
+        if use_elite_loss and elite_loss_available and sample_count_for_elite > 1:
+            reward_for_elite = total_reward.view(sample_count_for_elite, batch_size)
+            logp_for_elite = logp_sum.view(sample_count_for_elite, batch_size)
+            top_k = min(int(elite_top_k), sample_count_for_elite)
+            top_k = max(top_k, 1)
+            elite_reward, elite_idx = reward_for_elite.topk(top_k, dim=0)
+            elite_logp = logp_for_elite.gather(0, elite_idx)
+            loss_elite = -elite_logp.mean()
+            elite_reward_mean = elite_reward.mean().item()
+            elite_reward_gap = (elite_reward.mean(dim=0) - reward_for_elite.mean(dim=0)).mean().item()
+            elite_selected_count = int(elite_idx.numel())
 
         old_static_td = env._reward_static_td
         env._reward_static_td = td_static_for_mutation
@@ -575,7 +767,12 @@ def main():
             max_steps=max_steps,
         )
 
-        loss = loss_pg + mutation_loss_weight * loss_mutation - entropy_coef * entropy_mean
+        loss = (
+            loss_pg
+            + elite_loss_weight * loss_elite
+            + mutation_loss_weight * loss_mutation
+            - entropy_coef * entropy_mean
+        )
         loss_device = tensor_device_name(loss)
         if ep == 1:
             device_report = (
@@ -650,6 +847,10 @@ def main():
         writer.add_scalar("train/episode_steps_mean", step_counts.mean().item(), ep)
         writer.add_scalar("train/loss", loss.item(), ep)
         writer.add_scalar("train/loss_pg", loss_pg.item(), ep)
+        writer.add_scalar("train/loss_elite", loss_elite.item(), ep)
+        writer.add_scalar("train/elite_reward", elite_reward_mean, ep)
+        writer.add_scalar("train/elite_reward_gap", elite_reward_gap, ep)
+        writer.add_scalar("train/elite_selected_count", elite_selected_count, ep)
         writer.add_scalar("train/loss_mutation", loss_mutation.item(), ep)
         writer.add_scalar("train/entropy", entropy_mean.item(), ep)
         writer.add_scalar("train/mutation_improved_ratio", mutation_stats["improved_ratio"], ep)
@@ -660,7 +861,7 @@ def main():
         writer.add_scalar("train/advantage_mean", advantage.mean().item(), ep)
         writer.add_scalar("train/advantage_std", advantage.std(unbiased=False).item(), ep)
         writer.add_scalar("train/num_groups", reward_metrics["num_groups"].mean().item(), ep)
-        if ep % 10 == 0:
+        if ep % eval_interval == 0:
             policy.eval()
             with torch.no_grad():
                 actions_eval, _, _, reward_eval, _, _, _ = rollout_episode_from_td(
@@ -672,10 +873,58 @@ def main():
                     epsilon=0.0,
                 )
                 eval_metrics = env.reward_metrics_from_actions(actions_eval)
+
+                eval_start_count = int(baseline_num_samples)
+                eval_start_actions = select_initial_merge_start_actions(
+                    env=env,
+                    td=td_eval_fixed,
+                    num_starts=eval_start_count,
+                    top_ratio=1.0,
+                )
+                eval_reward_blocks = []
+                eval_num_group_blocks = []
+                for start in range(0, eval_start_count, eval_merge_start_chunk):
+                    end = min(start + eval_merge_start_chunk, eval_start_count)
+                    chunk_count = end - start
+                    td_eval_rollout = torch.cat([td_eval_fixed] * chunk_count, dim=0)
+                    forced_eval_actions = eval_start_actions[:, start:end].transpose(0, 1).reshape(-1)
+                    td_eval_after_start = env.step(td_eval_rollout, forced_eval_actions)
+                    suffix_eval_actions, _, _, _, _ = rollout_policy_actions_from_td(
+                        env=env,
+                        policy=policy,
+                        td_init=td_eval_after_start,
+                        max_steps=max_steps - 1,
+                        sample=False,
+                        epsilon=0.0,
+                    )
+                    suffix_eval_actions = pad_rollout_tensor(suffix_eval_actions, max_steps - 1, value=0.0)
+                    merge_start_eval_actions = torch.cat(
+                        [forced_eval_actions[:, None], suffix_eval_actions], dim=1
+                    )
+                    old_eval_static_td = env._reward_static_td
+                    env._reward_static_td = td_eval_rollout.clone().to(env.device)
+                    eval_reward_chunk = env.reward_from_actions(merge_start_eval_actions)
+                    eval_metric_chunk = env.reward_metrics_from_actions(merge_start_eval_actions)
+                    env._reward_static_td = old_eval_static_td
+                    eval_reward_blocks.append(eval_reward_chunk.view(chunk_count, eval_batch_size))
+                    eval_num_group_blocks.append(eval_metric_chunk["num_groups"].view(chunk_count, eval_batch_size))
+
+                eval_merge_reward_matrix = torch.cat(eval_reward_blocks, dim=0)
+                eval_merge_group_matrix = torch.cat(eval_num_group_blocks, dim=0)
+                eval_merge_start_mean_reward = eval_merge_reward_matrix.mean().item()
+                eval_merge_start_best_per_instance = eval_merge_reward_matrix.max(dim=0).values
+                eval_merge_start_best_reward = eval_merge_start_best_per_instance.mean().item()
+                eval_merge_start_best_gap = (
+                    eval_merge_start_best_per_instance - eval_merge_reward_matrix.mean(dim=0)
+                ).mean().item()
             avg_eval = reward_eval.mean().item()
             writer.add_scalar("eval/reward_total", avg_eval, ep)
             writer.add_scalar("eval/reward_greedy", avg_eval, ep)
             writer.add_scalar("eval/num_groups", eval_metrics["num_groups"].mean().item(), ep)
+            writer.add_scalar("eval/merge_start_mean_reward", eval_merge_start_mean_reward, ep)
+            writer.add_scalar("eval/merge_start_best_reward", eval_merge_start_best_reward, ep)
+            writer.add_scalar("eval/merge_start_best_gap", eval_merge_start_best_gap, ep)
+            writer.add_scalar("eval/merge_start_mean_num_groups", eval_merge_group_matrix.mean().item(), ep)
             # =========================
             # ?�� [추�?] BEST MODEL ?�??
             # =========================
@@ -694,6 +943,7 @@ def main():
                 f"train_baseline={baseline_log_value:.4f} "
                 f"baseline_mode={baseline_mode} "
                 f"eval_greedy={avg_eval:.4f} "
+                f"eval_merge_best={eval_merge_start_best_reward:.4f} "
                 f"train_feasible={reward_metrics['feasible'].mean().item():.3f} "
                 f"eval_feasible={eval_metrics['feasible'].mean().item():.3f} "
                 f"loss={loss.item():.4f} "
